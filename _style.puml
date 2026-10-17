@@ -1,0 +1,17 @@
+' Shared look & feel. Included by every diagram with:  !include _style.puml
+skinparam shadowing false
+skinparam classAttributeIconSize 0
+skinparam defaultFontSize 12
+skinparam roundCorner 6
+skinparam ArrowColor #343A40
+skinparam ClassBackgroundColor #F8F9FA
+skinparam ClassBorderColor #495057
+skinparam NoteBackgroundColor #FFF9DB
+skinparam NoteBorderColor #B59B00
+skinparam PackageBorderColor #868E96
+skinparam SequenceLifeLineBorderColor #868E96
+skinparam SequenceGroupBackgroundColor #F1F3F5
+skinparam StateBackgroundColor #F8F9FA
+skinparam ActivityBackgroundColor #F8F9FA
+skinparam maxMessageSize 220
+skinparam wrapWidth 430

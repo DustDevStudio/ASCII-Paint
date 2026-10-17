@@ -1,0 +1,83 @@
+@startuml 02_components
+!include _style.puml
+title Architecture - Cargo workspace (crates) and external dependencies
+
+package "Cargo workspace  ascii_paint/" {
+
+  component "ascii_core\n(lib)" as Core <<crate>>
+  component "ascii_render\n(lib)" as Render <<crate>>
+  component "ascii_io\n(lib)" as IO <<crate>>
+  component "ascii_app\n(bin)" as App <<crate>>
+
+  folder "assets/" as Assets {
+    file "fonts/default.*\n(8 x 15 px cell font)" as FontFile
+  }
+}
+
+package "Third-party crates" {
+  component "eframe / egui" as Egui <<crate>>
+  component "rfd\n(native file dialogs)" as Rfd <<crate>>
+  component "image\n(PNG encoder)" as ImageCrate <<crate>>
+  component "fontdue\n(glyph rasteriser)" as Fontdue <<crate>>
+  component "zstd + crc32fast" as Zstd <<crate>>
+  component "serde + serde_json" as Serde <<crate>>
+  component "dirs\n(config / documents folder)" as Dirs <<crate>>
+  component "thiserror" as Thiserror <<crate>>
+}
+
+component "ffmpeg executable" as FFmpeg <<external process>>
+
+App ..> Core : model, tools, history
+App ..> Render : GlyphSource, thumbnails
+App ..> IO : repository, recent store, exporters
+App ..> Egui
+App ..> Rfd
+App ..> Dirs : default project folder
+Render ..> Core : Frame, CanvasSpec
+Render ..> Fontdue
+IO ..> Core
+IO ..> Render : FrameRasterizer
+IO ..> Zstd
+IO ..> ImageCrate
+IO ..> Serde
+IO ..> Dirs : config dir
+Core ..> Thiserror
+IO ..> Thiserror
+IO ..> FFmpeg : spawns, raw RGBA over stdin
+Render ..> FontFile : include_bytes!
+App ..> FontFile : fallback path at runtime
+
+interface "GlyphSource" as IGlyph
+Render -up- IGlyph
+App ..> IGlyph
+IO ..> IGlyph
+
+note right of Core
+  ascii_core: NO dependency on egui, files, threads or the clock.
+  Contains modules model, selection, algo, tools, history.
+  100 % unit-testable (tools are driven by ToolEvent values).
+  Time is injected (Clock), never read inside the crate.
+end note
+
+note right of IO
+  ascii_io: format (codecs), storage (repository, recent list, atomic writer),
+  export (PNG, .ascii, .aanim, MP4 worker).
+  Only place that touches the file system or spawns processes.
+end note
+
+note bottom of App
+  ascii_app: eframe application, screens, modals, panels, canvas renderer.
+  Threads: the UI thread + at most ONE export worker thread (MP4).
+  Dependency rule: arrows only point downwards / to the left in this diagram. ascii_core never depends on another workspace crate.
+end note
+
+note bottom of Assets
+  Suggested source tree
+  ascii_paint/Cargo.toml (workspace)
+  crates/ascii_core/src/{model, selection, algo, tools, history}/
+  crates/ascii_render/src/{glyph_source.rs, rasterizer.rs, thumbnail.rs}
+  crates/ascii_io/src/{format, storage, export}/
+  crates/ascii_app/src/{main.rs, app.rs, modals/, editor/}
+  assets/fonts/
+end note
+@enduml

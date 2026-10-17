@@ -1,0 +1,93 @@
+@startuml 16a_seq_zoom_pan
+!include _style.puml
+title Sequence - Zoom and pan the screen view
+autonumber
+
+actor User
+participant "CanvasView" as CV
+participant "Viewport" as VP
+participant "CanvasRenderer" as R
+
+== zoom with the mouse wheel ==
+User -> CV : scroll wheel by dy at screen point p (pointer is over the canvas)
+CV -> CV : notches = dy / 50.0   (smooth-scroll friendly, sign: up = zoom in)
+CV -> VP : zoom_at(p, notches)
+VP -> VP : z' = clamp(zoom * 1.1^notches, 0.1, 16.0)
+VP -> VP : origin' = (p - view.min) - ((p - view.min) - origin) * (z' / zoom);  zoom = z'
+VP -> VP : pan clamp: keep >= 64 screen px of the page visible on each axis
+
+== pan ==
+User -> CV : middle-button drag, or hold Space + left-button drag
+CV -> CV : while Space is held, tool events are suppressed
+loop for each pointer delta d
+  CV -> VP : pan_by(d, view, canvas)
+  VP -> VP : origin += d; clamp (>= 64 px of the page visible)
+end
+
+== menu / keyboard ==
+User -> CV : View > Zoom in (Ctrl+=) / Zoom out (Ctrl+-)
+CV -> VP : zoom_step(+1 or -1, view)   (z' = clamp(zoom * 1.25^dir); the view centre stays fixed)
+User -> CV : View > Fit to window (Ctrl+0)
+CV -> VP : fit(view, canvas)
+User -> CV : View > Actual size (Ctrl+1)
+CV -> VP : actual_size(view, canvas)
+
+== redraw ==
+CV -> R : paint(painter, rect, session)
+R -> VP : visible_cells(view, canvas)
+VP --> R : CellRect  (only these cells are drawn)
+R -> R : grid lines only when zoom >= 2.0
+note over VP, R
+  Zoom / pan never touch the project, never create commands and never mark it dirty.
+  The status bar shows the zoom as round(zoom * 100) %.
+end note
+@enduml
+
+@startuml 16b_seq_playback
+!include _style.puml
+title Sequence - Playback of the frames at the project FPS
+autonumber
+
+actor User
+participant "FramePanel" as FP
+participant "EditorSession" as S
+participant "ToolRegistry" as TR
+participant "PlaybackController" as PC
+participant "Timeline" as T
+participant "AsciiPaintApp.update()" as App
+participant "egui Context" as Ctx
+
+User -> FP : click [Play]  (disabled when only 1 frame)
+FP -> S : toggle_playback(now)
+S -> TR : dispatch(Cancel)   (commits / discards any busy tool)
+S -> PC : play(now)
+PC -> PC : state = Playing; last_advance = now
+
+loop every egui frame while Playing
+  App -> S : playback.tick(now, &mut timeline)
+  S -> PC : tick(now, timeline)
+  PC -> PC : elapsed = now - last_advance;  period = 1 / fps
+  alt elapsed >= period
+    PC -> PC : n = floor(elapsed / period); last_advance += n * period
+    alt selected + n >= len and !looping
+      PC -> T : select(len - 1)
+      PC -> PC : state = Stopped
+      PC --> S : None
+    else
+      PC -> T : select((selected + n) % len)   (modulo only when looping)
+      PC --> S : Some(period - (now - last_advance))
+    end
+  else
+    PC --> S : Some(period - elapsed)
+  end
+  opt Some(wait)
+    App -> Ctx : request_repaint_after(wait)
+  end
+  note right of App : CanvasRenderer draws the newly selected frame,\nincluding ITS background colour. Editing tools receive no events.
+end
+
+User -> FP : click [Pause] (or any edit / click on a frame / open a modal)
+FP -> S : toggle_playback(now) / select_frame(i) / ...
+S -> PC : pause()
+PC -> PC : state = Stopped   (the current frame stays selected)
+@enduml

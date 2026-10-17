@@ -1,0 +1,350 @@
+@startuml 07_class_io_render
+!include _style.puml
+title Rendering, file formats, persistence and export - crates ascii_render and ascii_io
+
+package "ascii_render" {
+
+  interface GlyphSource <<trait, Send + Sync>> {
+    + font_name() -> &str
+    + cell_size() -> (u8, u8)
+    + contains(ch: char) -> bool
+    + mask(ch: char) -> Arc<GlyphMask>
+  }
+
+  class GlyphMask <<struct>> {
+    + width: u8
+    + height: u8
+    + alpha: Vec<u8>
+  }
+
+  class TtfGlyphSource <<struct>> {
+    - font: fontdue::Font
+    - name: String
+    - cell_w: u8
+    - cell_h: u8
+    - baseline: i32
+    - cache: RwLock<HashMap<char, Arc<GlyphMask>>>
+    + {static} DEFAULT_FONT_PATH: &str = "assets/fonts/default.ttf"
+    + load_default(cell_w: u8, cell_h: u8) -> Result<TtfGlyphSource, FontError>
+    + from_bytes(bytes: &[u8], name: &str, cell_w: u8, cell_h: u8) -> Result<TtfGlyphSource, FontError>
+  }
+
+  class RgbaBuffer <<struct>> {
+    + width: u32
+    + height: u32
+    + pixels: Vec<u8>
+  }
+
+  class FrameRasterizer <<utility>> {
+    + {static} render(frame: &Frame, canvas: &CanvasSpec, glyphs: &dyn GlyphSource) -> RgbaBuffer
+  }
+
+  class ThumbnailBuilder <<utility>> {
+    + {static} build(frame: &Frame) -> RgbaBuffer
+  }
+}
+
+package "ascii_io::format" {
+
+  enum FileKind <<enum>> {
+    Ascii
+    Aanim
+    Aspr
+    + magic() -> [u8; 4]
+    + extension() -> &str
+  }
+
+  class ContainerHeader <<struct>> {
+    + magic: [u8; 4]
+    + version: u16
+    + flags: u16
+    + uncompressed_len: u32
+    + stored_len: u32
+    + crc32: u32
+  }
+
+  class ContainerCodec <<utility>> {
+    + {static} wrap(kind: FileKind, payload: &[u8]) -> Result<Vec<u8>, FormatError>
+    + {static} unwrap(kind: FileKind, bytes: &[u8]) -> Result<Vec<u8>, FormatError>
+  }
+
+  class FrameBlockCodec <<utility>> {
+    + {static} write(out: &mut Vec<u8>, frame: &Frame)
+    + {static} read(r: &mut ByteReader, canvas: &CanvasSpec, id: FrameId) -> Result<Frame, FormatError>
+  }
+
+  class ByteReader <<struct>> {
+    - data: &[u8]
+    - pos: usize
+    + u8() -> Result<u8, FormatError>
+    + u16() -> Result<u16, FormatError>
+    + u32() -> Result<u32, FormatError>
+    + i64() -> Result<i64, FormatError>
+    + string() -> Result<String, FormatError>
+    + bytes(n: usize) -> Result<&[u8], FormatError>
+    + remaining() -> usize
+  }
+
+  interface FormatCodec<T> <<trait>> {
+    + kind() -> FileKind
+    + encode(value: &T) -> Result<Vec<u8>, FormatError>
+    + decode(bytes: &[u8]) -> Result<T, FormatError>
+  }
+
+  class AsciiImage <<struct>> {
+    + canvas: CanvasSpec
+    + font_name: String
+    + frame: Frame
+  }
+
+  class AsciiAnimation <<struct>> {
+    + canvas: CanvasSpec
+    + font_name: String
+    + fps: Fps
+    + looping: bool
+    + frames: Vec<Frame>
+  }
+
+  class AsciiCodec <<struct>>
+  class AanimCodec <<struct>>
+  class AsprCodec <<struct>>
+
+  enum FormatError <<enum>> {
+    Truncated
+    BadMagic
+    UnsupportedVersion(found: u16)
+    ReservedFlags(flags: u16)
+    CrcMismatch
+    LengthMismatch
+    InvalidField(name: &str, reason: String)
+    Compression(String)
+  }
+}
+
+package "ascii_io::storage" {
+
+  class ProjectRepository <<struct>> {
+    + load(path: &Path) -> Result<Project, RepoError>
+    + save(path: &Path, project: &Project) -> Result<(), RepoError>
+    + exists(path: &Path) -> bool
+  }
+
+  class AtomicWriter <<utility>> {
+    + {static} write(path: &Path, bytes: &[u8]) -> io::Result<()>
+  }
+
+  class RecentStore <<struct>> {
+    - file: PathBuf
+    - entries: Vec<RecentEntry>
+    + {static} MAX_ENTRIES: usize = 10
+    + open_default() -> RecentStore
+    + entries() -> &[RecentEntry]
+    + touch(path: PathBuf, name: String, now: i64)
+    + remove(path: &Path)
+    + clear()
+    - persist()
+  }
+
+  class RecentEntry <<struct, Serialize, Deserialize>> {
+    + name: String
+    + path: PathBuf
+    + last_opened_unix: i64
+  }
+
+  enum RepoError <<enum>> {
+    Io(io::Error)
+    Format(FormatError)
+    NotFound
+  }
+}
+
+package "ascii_io::export" {
+
+  class ExportService <<struct>> {
+    + export_frame_png(project: &Project, path: &Path, glyphs: &dyn GlyphSource) -> Result<(), ExportError>
+    + export_frame_ascii(project: &Project, path: &Path, glyphs: &dyn GlyphSource) -> Result<(), ExportError>
+    + export_animation_aanim(project: &Project, path: &Path, glyphs: &dyn GlyphSource) -> Result<(), ExportError>
+    + start_mp4(project: &Project, path: PathBuf, glyphs: Arc<dyn GlyphSource>, ffmpeg: PathBuf) -> ExportJobHandle
+  }
+
+  class ExportJobHandle <<struct>> {
+    + rx: Receiver<ExportMessage>
+    + cancel: Arc<AtomicBool>
+    - join: Option<JoinHandle<()>>
+    + request_cancel()
+    + poll() -> Vec<ExportMessage>
+  }
+
+  enum ExportMessage <<enum>> {
+    Progress(done: u32, total: u32)
+    Finished(path: PathBuf)
+    Failed(ExportError)
+    Cancelled
+  }
+
+  class Mp4Worker <<struct>> {
+    - frames: Vec<Frame>
+    - canvas: CanvasSpec
+    - fps: Fps
+    - out: PathBuf
+    - ffmpeg: PathBuf
+    + run(tx: Sender<ExportMessage>, cancel: Arc<AtomicBool>)
+  }
+
+  class FfmpegLocator <<utility>> {
+    + {static} find() -> Option<PathBuf>
+  }
+
+  enum ExportError <<enum>> {
+    Io(io::Error)
+    Image(String)
+    Format(FormatError)
+    FfmpegNotFound
+    FfmpegFailed(status: i32, stderr_tail: String)
+    Cancelled
+  }
+
+  class Clock <<trait object>> {
+    + now_unix() -> i64
+  }
+}
+
+class "ffmpeg" as Ffmpeg <<external process>>
+
+' ---- relationships ----
+GlyphSource <|.. TtfGlyphSource
+GlyphSource ..> GlyphMask
+FrameRasterizer ..> GlyphSource
+FrameRasterizer ..> RgbaBuffer : returns
+ThumbnailBuilder ..> RgbaBuffer : returns
+FrameRasterizer ..> Frame
+ThumbnailBuilder ..> Frame
+
+FormatCodec <|.. AsciiCodec : T = AsciiImage
+FormatCodec <|.. AanimCodec : T = AsciiAnimation
+FormatCodec <|.. AsprCodec : T = Project
+AsciiCodec ..> ContainerCodec
+AanimCodec ..> ContainerCodec
+AsprCodec ..> ContainerCodec
+AsciiCodec ..> FrameBlockCodec
+AanimCodec ..> FrameBlockCodec
+AsprCodec ..> FrameBlockCodec
+ContainerCodec *-- ContainerHeader
+ContainerCodec ..> FileKind
+FrameBlockCodec ..> ByteReader
+AsciiCodec ..> AsciiImage
+AanimCodec ..> AsciiAnimation
+ContainerCodec ..> FormatError
+FrameBlockCodec ..> FormatError
+
+ProjectRepository ..> AsprCodec
+ProjectRepository ..> AtomicWriter
+ProjectRepository ..> RepoError
+RecentStore *-- "0..10" RecentEntry
+RecentStore ..> AtomicWriter
+
+ExportService ..> FrameRasterizer
+ExportService ..> AsciiCodec
+ExportService ..> AanimCodec
+ExportService ..> AtomicWriter
+ExportService ..> ExportJobHandle : creates
+ExportJobHandle *-- ExportMessage : channel
+ExportJobHandle ..> Mp4Worker : spawns thread
+Mp4Worker ..> FrameRasterizer
+Mp4Worker ..> Ffmpeg : stdin pipe (raw RGBA)
+Mp4Worker ..> ExportMessage : sends
+FfmpegLocator ..> Ffmpeg : looks up
+ExportMessage ..> ExportError
+
+note as N1
+  Font loading
+  - The default font is loaded from the project assets folder: DEFAULT_FONT_PATH (adjust to the real file name in /assets/fonts).
+    It is embedded with include_bytes! in release builds so the executable is self-contained.
+  - The font is rasterised by fontdue at the pixel height that makes the glyph box fit cell_w x cell_h (8 x 15).
+    mask(ch) returns an alpha mask of EXACTLY cell_w * cell_h bytes: the glyph is placed on the baseline, clipped to the cell.
+  - If the font has no glyph for ch, mask() returns the mask of '?' and contains() returns false.
+  - If the asset is a BITMAP font (BDF / PSF) replace TtfGlyphSource by another GlyphSource implementation;
+    nothing else in the design changes (everything depends on the GlyphSource trait only).
+end note
+
+note as N2
+  render() - exact compositing (see activity diagram 20)
+  - Output size = canvas.pixel_width x canvas.pixel_height (1920 x 1080 for the default canvas), RGBA8, alpha always 255.
+  - pixel = frame.background; if cell.bg = Some(c) pixel = c; then pixel = lerp(pixel, cell.fg, mask_alpha / 255).
+  ThumbnailBuilder::build(frame): ONE pixel per cell (cols x rows image):
+    base = cell.bg or frame.background;  if glyph != ' ' pixel = lerp(base, cell.fg, 0.6) else pixel = base.
+end note
+
+note as N3
+  wrap(kind, payload): header.magic = kind.magic(), version = 1, uncompressed_len = payload.len(), crc32 = crc32fast(payload),
+  payload is compressed with zstd level 3 and flags bit0 = 1 (stored_len = compressed length).
+  If compression does not make it smaller, store raw with flags bit0 = 0 (stored_len = uncompressed_len).
+  unwrap(kind, bytes): see decode activity diagram (20). Binary layouts: diagram 08.
+end note
+
+note as N4
+  save(path, project): bytes = AsprCodec.encode(project); AtomicWriter::write(path, bytes).
+  load(path): read whole file -> AsprCodec.decode. io NotFound -> RepoError::NotFound.
+  The caller (AsciiPaintApp) is responsible for project.touch_modified(now) before save and for history.mark_clean() after success.
+end note
+
+note as N5
+  write(path, bytes): 1) tmp = path + ".tmp" in the same directory  2) write all bytes, flush, File::sync_all()
+  3) fs::rename(tmp, path) (atomic replace on the same volume)  4) on ANY error remove tmp and return the error.
+  A crash therefore leaves either the old file or the new file, never a half-written one.
+end note
+
+note as N6
+  - Stored as JSON { "version": 1, "entries": [ {"name", "path", "last_opened_unix"} ] } in <config_dir>/AsciiPaint/recent.json
+    (dirs::config_dir()). Missing / corrupt file -> empty list (a corrupt file is renamed recent.json.bad, never a crash).
+  - touch(): remove an existing entry with the same path, insert at index 0, truncate to MAX_ENTRIES, persist().
+  - entries() is always sorted by last_opened_unix descending (guaranteed by touch()).
+  - Called on: project created, project opened, Save As to a new .aspr path.
+end note
+
+note as N7
+  PNG       : buf = FrameRasterizer::render(selected frame); image crate encodes RGBA8 PNG; AtomicWriter.
+  .ascii    : AsciiCodec.encode(AsciiImage{ canvas, font_name, frame = selected frame clone }); AtomicWriter.
+  .aanim    : AanimCodec.encode(AsciiAnimation{ canvas, font_name, fps, looping, frames = all frames }); AtomicWriter.
+  MP4       : start_mp4() clones the frames into Mp4Worker and spawns ONE std::thread; returns immediately.
+  PNG / .ascii / .aanim run synchronously on the UI thread (small, fast). Only MP4 is asynchronous.
+end note
+
+note as N8
+  run():
+  1. spawn  ffmpeg -y -hide_banner -loglevel error -f rawvideo -pix_fmt rgba -s {W}x{H} -framerate {fps} -i pipe:0
+            -vf pad=ceil(iw/2)*2:ceil(ih/2)*2 -c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p -movflags +faststart
+            -f mp4 {out}.part      (stdin piped, stderr piped; no shell is used, each token is one argument)
+  2. a helper thread drains stderr into a ring buffer of the last 4 KiB (prevents a full pipe from blocking ffmpeg).
+  3. for i in 0..frames.len(): if cancel is set -> kill child, delete {out}.part, send Cancelled, return.
+       buf = FrameRasterizer::render(frames[i]); stdin.write_all(&buf.pixels); send Progress(i + 1, total).
+  4. drop(stdin); status = child.wait(). status != 0 -> delete .part, send Failed(FfmpegFailed(code, stderr_tail)).
+  5. fs::rename({out}.part, {out}); send Finished(out).
+  Any io error on the pipe -> kill child, delete .part, send Failed(Io).
+end note
+
+note as N9
+  find(): 1) <exe dir>/ffmpeg(.exe)  2) search every directory in PATH for ffmpeg(.exe).  Returns the first executable found.
+  Evaluated once at startup and again each time the Save modal opens (so installing ffmpeg does not need a restart).
+end note
+
+
+' ---- rule notes: attached to their class, stacked in one column (hidden links) ----
+TtfGlyphSource .. N1
+FrameRasterizer .. N2
+ContainerCodec .. N3
+ProjectRepository .. N4
+AtomicWriter .. N5
+RecentStore .. N6
+ExportService .. N7
+Mp4Worker .. N8
+FfmpegLocator .. N9
+N1 -[hidden]down-> N2
+N2 -[hidden]down-> N3
+N3 -[hidden]down-> N4
+N4 -[hidden]down-> N5
+N5 -[hidden]down-> N6
+N6 -[hidden]down-> N7
+N7 -[hidden]down-> N8
+N8 -[hidden]down-> N9
+@enduml

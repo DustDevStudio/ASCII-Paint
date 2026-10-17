@@ -1,0 +1,119 @@
+@startuml 19a_act_flood_fill
+!include _style.puml
+title Activity - FloodFill::region(grid, seed, channel, limit)  (4-connected scanline fill, no recursion)
+
+start
+:value(c) := channel == Foreground ? Fg(grid[c].fg) : Bg(grid[c].bg)
+(a comparable ChannelValue, Bg(None) != Bg(Some(x)));
+:target := value(seed);
+:visited := bitset(cols * rows) all false;
+:result := empty Vec<CellCoord>;
+:stack := [seed];
+
+while (stack is not empty?) is (yes)
+  :(x, y) := stack.pop();
+  if (visited[x, y] or !limit.permits((x, y)) or value((x, y)) != target) then (yes)
+    :continue;
+  else (no)
+    :xl := x, then xl -= 1 while xl > 0 and ok(xl - 1, y);
+    :xr := x, then xr += 1 while xr < cols - 1 and ok(xr + 1, y);
+    note right
+      ok(i, y) = !visited[i, y] and limit.permits((i, y)) and value((i, y)) == target
+    end note
+    :for i in xl ..= xr : visited[i, y] := true, result.push((i, y));
+    :for each neighbour row ny in [y - 1, y + 1] that is inside the grid:
+      scan i from xl to xr,
+      when ok(i, ny) and (i == xl or !ok(i - 1, ny)) -> stack.push((i, ny))  (one seed per contiguous span);
+  endif
+endwhile (no)
+
+:sort result by (row, col)  (deterministic patch order);
+:return result;
+stop
+
+note right
+  Complexity O(cells): every cell is marked visited once. Max 17 280 cells for the default page.
+  The caller guarantees the seed is permitted by `limit` and that the seed does not already hold the paint colour
+  (otherwise the region would be re-painted with the same value and the tool records nothing).
+end note
+@enduml
+
+@startuml 19b_act_shape_rasterization
+!include _style.puml
+title Activity - ShapeRasterizer (line, rect, ellipse, polygon). All results are clipped to 0..cols, 0..rows
+
+partition "line(a, b)  -  Bresenham, used by strokes and polygon outlines" {
+  start
+  :dx := |b.col - a.col|, dy := -|b.row - a.row|;
+  :sx := sign(b.col - a.col) (1 if equal), sy := sign(b.row - a.row) (1 if equal);
+  :err := dx + dy, (x, y) := a, out := [a];
+  while ((x, y) != b?) is (yes)
+    :e2 := 2 * err;
+    if (e2 >= dy) then (yes)
+      :err += dy, x += sx;
+    endif
+    if (e2 <= dx) then (yes)
+      :err += dx, y += sy;
+    endif
+    :out.push((x, y));
+  endwhile (no)
+  :return out  (includes a and b, in order);
+  stop
+}
+
+partition "rect(a, b)" {
+  start
+  :r := CellRect::from_corners(a, b) clamped to the page;
+  :return every cell of r (row-major);
+  stop
+}
+
+partition "ellipse(a, b)  -  ellipse inscribed in the dragged rectangle" {
+  start
+  :r := CellRect::from_corners(a, b) clamped to the page;
+  :w := r.width(), h := r.height();
+  :cx := r.min.col + w / 2.0, cy := r.min.row + h / 2.0   (centre in cell space, cell k spans [k, k + 1));
+  :rx := w / 2.0, ry := h / 2.0;
+  :out := [];
+  repeat :for each cell (c, r0) in r;
+    :dx := ((c + 0.5) - cx) / rx, dy := ((r0 + 0.5) - cy) / ry;
+    if (dx*dx + dy*dy <= 1.0) then (yes)
+      :out.push((c, r0));
+    endif
+  repeat while (more cells?) is (yes)
+  :return out;
+  stop
+  note right
+    The cell CENTRE decides membership. Because the transform from cell space to pixels is a pure scale, the result is the same
+    as testing in pixel space (8 x 15 px cells) - the ellipse looks round on screen.
+    Examples: 1x1 -> that cell. 2x2 -> all 4 cells. 3x3 -> all 9 cells. 5x3 -> 13 cells (corners removed).
+  end note
+}
+
+partition "polygon(vertices, spec)  -  vertices are cell CENTRES, even-odd rule" {
+  start
+  :n := vertices.len() (caller guarantees n >= 3);
+  :out := empty set;
+  repeat :for each row r in min_row ..= max_row of the vertices;
+    :y := r + 0.5, xs := empty list;
+    repeat :for each edge (p, q) = (v[i], v[(i + 1) % n]);
+      if (p.row != q.row and (y1 <= y < y2 or y2 <= y < y1)?) then (yes)
+        :xs.push(x1 + (y - y1) * (x2 - x1) / (y2 - y1));
+      endif
+    repeat while (more edges?) is (yes)
+    note right
+      y1 = p.row + 0.5, y2 = q.row + 0.5, x1 = p.col + 0.5, x2 = q.col + 0.5.
+      The half-open test y1 <= y < y2 counts a vertex shared by two edges exactly once (no double crossings).
+    end note
+    :sort xs ascending;
+    :for each pair (xa, xb) = (xs[0], xs[1]), (xs[2], xs[3]) ...
+    insert (c, r) into out for every column c with xa <= c + 0.5 < xb;
+  repeat while (more rows?) is (yes)
+  :Outline: for each edge (v[i], v[(i + 1) % n]) : out ∪= line(v[i], v[(i + 1) % n]);
+  note right
+    The outline guarantees that vertex cells and thin / degenerate shapes (all vertices on one line) are never empty.
+  end note
+  :return out sorted by (row, col), clipped to the page;
+  stop
+}
+@enduml

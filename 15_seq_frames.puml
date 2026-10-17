@@ -1,0 +1,128 @@
+@startuml 15a_seq_frame_operations
+!include _style.puml
+title Sequence - Frame list operations (add, duplicate, delete, reorder, select, fps)
+autonumber
+
+actor User
+participant "FramePanel" as FP
+participant "EditorSession" as S
+participant "Command\n(Add/Delete/Move/SetPlaybackSettings)" as C
+participant "History" as H
+participant "Timeline" as T
+participant "ThumbnailCache" as TC
+
+alt User clicks [+ Add]
+  User -> FP : click Add
+  FP -> S : add_frame()
+  S -> S : playback.pause()
+  S -> C : AddFrameCommand::blank_after(project, selected_index)\n(new FrameId; background = background of the selected frame)
+  S -> H : execute(cmd, project)
+  H -> C : apply(project)
+  C -> T : insert(selected + 1, frame); select(selected + 1)
+else User clicks [Duplicate]
+  User -> FP : click Duplicate
+  FP -> S : duplicate_frame()
+  S -> C : AddFrameCommand::duplicate(project, selected_index)\n(copy of grid AND background, new FrameId)
+  S -> H : execute(cmd, project)
+  H -> C : apply(project)
+  C -> T : insert(selected + 1, copy); select(selected + 1)
+else User clicks [Delete]  (disabled when len == 1)
+  User -> FP : click Delete
+  FP -> S : delete_frame()
+  S -> C : DeleteFrameCommand::new(project, selected_index)
+  S -> H : execute(cmd, project)
+  H -> C : apply(project)
+  C -> T : remove(index); select(min(index, len - 1))
+else User drags frame i and drops it on slot j
+  User -> FP : drag item i  (FrameDrag{ from: i, hover_slot })
+  FP -> FP : draws an insertion line at hover_slot while dragging
+  User -> FP : release at slot j
+  opt j != i
+    FP -> S : move_frame(i, to)   (to = j adjusted by -1 when j > i, i.e. index after removal)
+    S -> C : MoveFrameCommand{ from: i, to, selected_before }
+    S -> H : execute(cmd, project)
+    H -> C : apply(project)
+    C -> T : move_frame(i, to); select(to)
+  end
+else User clicks frame i
+  User -> FP : click item i
+  FP -> S : select_frame(i)
+  S -> S : playback.pause()
+  S -> T : select(i)   (not undoable, not dirty-making; selection mask is kept)
+else User changes FPS or Loop
+  User -> FP : commit FPS field (Enter / focus lost / drag released) or toggle Loop
+  FP -> S : set_fps(f) / set_looping(b)
+  S -> C : SetPlaybackSettingsCommand{ before, after }   (skipped when equal)
+  S -> H : execute(cmd, project)
+end
+
+... next egui frame ...
+FP -> TC : get(ctx, frame) for every visible item
+TC -> TC : rebuild only entries whose Frame.revision changed;\nretain_only(current frame ids) drops textures of deleted frames
+@enduml
+
+@startuml 15b_seq_frame_background
+!include _style.puml
+title Sequence - Edit frame background colour
+autonumber
+
+actor User
+participant "FramePanel" as FP
+participant "AsciiPaintApp" as App
+participant "ColorPickerModal" as M
+participant "EditorSession" as S
+participant "History" as H
+participant "Frame(s)" as F
+participant "CanvasRenderer /\nThumbnailCache" as R
+
+User -> FP : click the "Background" swatch of the selected frame
+FP --> App : AppAction::OpenColorPicker(ColorPickTarget::FrameBackground(frame_id))
+App -> S : playback.pause()
+App -> M : new(target, original = Some(frame.background), allow_transparent = false, apply_to_all = false)
+App -> App : modal = Some(Modal::ColorPicker(M))
+
+loop while open
+  User -> M : drag RGB sliders / type #RRGGBB / click a preset swatch
+  M -> M : working = Some(colour)   (hex field validated live; invalid text keeps the old colour and shows a red border)
+  opt User ticks "Apply to all frames"
+    User -> M : toggle checkbox
+    M -> M : apply_to_all = true
+  end
+end
+
+alt User clicks Cancel or presses Esc
+  M --> App : ModalOutcome::Cancelled
+  App -> App : modal = None   (no command, project untouched)
+else User clicks OK
+  M --> App : Accepted(AppAction::ApplyColor(FrameBackground(frame_id), Some(rgb), apply_to_all))
+  App -> S : set_frame_background(frame_id, rgb, apply_to_all)
+  alt apply_to_all == false
+    S -> S : cmd = SetFrameBackgroundCommand::new(project, frame_id, rgb)
+    note right of S : returns None when the colour is unchanged -> nothing recorded
+  else apply_to_all == true
+    S -> S : cmd = CompositeCommand("Set background (all frames)")\nwith one SetFrameBackgroundCommand per frame whose colour differs
+  end
+  opt cmd is Some
+    S -> H : execute(cmd, project)
+    H -> F : apply(): frame.set_background(rgb) for each target frame  (revision += 1)
+  end
+  App -> App : modal = None
+end
+
+... next egui frame ...
+R -> F : CanvasRenderer fills the PAGE rectangle with selected_frame().background
+R -> F : ThumbnailCache sees the new revision -> rebuilds the thumbnail(s) (cells with bg = None now show the new colour)
+
+== alternative path: hex field in the Frame panel ==
+User -> FP : edit hex text of the Background row and press Enter (or leave the field)
+alt text is a valid #RRGGBB
+  FP -> S : set_frame_background(selected frame id, rgb, false)
+else invalid
+  FP -> FP : revert the text to the current colour
+end
+
+== undo ==
+User -> S : Ctrl+Z
+S -> H : undo(project)
+H -> F : revert(): frame.set_background(before)  (and select the affected frame for single-frame commands)
+@enduml

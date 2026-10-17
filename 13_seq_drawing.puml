@@ -1,0 +1,170 @@
+@startuml 13a_seq_paint_stroke
+!include _style.puml
+title Sequence - Paint cell / Clear cell stroke (mouse drag on the canvas)
+autonumber
+
+actor User
+participant "CanvasView" as CV
+participant "Viewport" as VP
+participant "ToolRegistry" as TR
+participant "StrokeTool<O>" as ST
+participant "Selection" as Sel
+participant "PatchBuilder" as PB
+participant "Frame\n(selected)" as F
+participant "History" as H
+participant "FramePanel /\nThumbnailCache" as TC
+
+User -> CV : primary button down at screen point p
+CV -> VP : screen_to_cell(p, canvas)
+VP --> CV : Some(c)   (None = outside the page: event is dropped)
+CV -> TR : dispatch(PointerDown(c, mods), ctx)
+TR -> ST : on_event(PointerDown(c, mods))
+ST -> PB : new(frame_id of selected frame)
+ST -> Sel : permits(c)
+Sel --> ST : bool
+opt permits(c)
+  ST -> PB : write(project, c, op.apply(old, brush))
+  PB -> F : get(c) then set_cell(c, new)   (only if new != old)
+  F -> F : revision += 1
+end
+ST --> TR : Consumed
+
+loop pointer moves while the button is held
+  User -> CV : move to p'
+  CV -> VP : screen_to_cell(p')
+  VP --> CV : Some(c') or None
+  CV -> TR : dispatch(PointerMove(cell), ctx)
+  TR -> ST : on_event(PointerMove(cell))
+  alt cell = Some(c')
+    ST -> ST : cells = ShapeRasterizer::line(last, c')  (Bresenham, excludes last)
+    loop for each k in cells
+      ST -> Sel : permits(k)
+      opt permitted
+        ST -> PB : write(project, k, op.apply(old, brush))
+        PB -> F : set_cell(k, new)  /  first-touch "before" kept in PatchBuilder
+      end
+    end
+    ST -> ST : last = c'
+  else cell = None
+    ST -> ST : ignored
+  end
+  note right of CV : egui repaints; CanvasRenderer reads the live grid,\nso the user sees the stroke immediately.
+end
+
+User -> CV : primary button up
+CV -> TR : dispatch(PointerUp(cell), ctx)
+TR -> ST : on_event(PointerUp)
+ST -> PB : finish(op.label())
+alt at least one cell really changed
+  PB --> ST : Some(CellPatchCommand)
+  ST -> H : record_applied(cmd)
+  H -> H : redo_stack.clear(); undo_stack.push(cmd); enforce limit 200
+  note right of H : history.is_dirty() is now true\n(window title shows "*")
+else nothing changed
+  PB --> ST : None   (nothing recorded)
+end
+ST -> ST : stroke = None
+... next egui frame ...
+TC -> F : revision() differs from cached thumbnail
+TC -> TC : ThumbnailBuilder::build(frame) and upload texture  (skipped while a tool is busy)
+@enduml
+
+@startuml 13b_seq_edit_text
+!include _style.puml
+title Sequence - Edit cell (typing characters)
+autonumber
+
+actor User
+participant "CanvasView" as CV
+participant "ToolRegistry" as TR
+participant "EditCellTool" as ET
+participant "Selection" as Sel
+participant "PatchBuilder" as PB
+participant "Frame\n(selected)" as F
+participant "History" as H
+
+User -> CV : click on cell c
+CV -> TR : dispatch(PointerDown(c, mods))
+TR -> ET : on_event(PointerDown(c))
+ET -> Sel : permits(c)
+alt permitted
+  ET -> ET : commit() previous session (if any)
+  ET -> ET : cursor = Some(c); anchor_col = c.col
+else not permitted
+  ET -> ET : ignored
+end
+note right of CV : the canvas takes keyboard focus on click
+
+User -> CV : types "A"  (egui Event::Text("A"))
+CV -> TR : dispatch(Text('A'))
+TR -> ET : on_event(Text('A'))
+alt cursor = None
+  ET --> TR : Ignored
+else cursor = Some(k)
+  ET -> Sel : permits(k)
+  opt permitted
+    ET -> PB : (create session lazily) new(frame_id)
+    ET -> PB : write(project, k, Cell{ glyph: 'A', fg: brush.paint, bg: old.bg })
+    PB -> F : set_cell(k, new); revision += 1
+    ET -> ET : next = (min(k.col + 1, cols - 1), k.row); if permits(next) cursor = next
+  end
+  ET --> TR : Consumed
+end
+
+User -> CV : presses Enter
+CV -> TR : dispatch(Key(Enter))
+TR -> ET : on_event(Key(Enter))
+ET -> ET : cursor = (min(anchor_col, cols - 1), min(row + 1, rows - 1))
+
+User -> CV : presses Escape
+CV -> TR : dispatch(Key(Escape))
+TR -> ET : on_event(Key(Escape))
+ET -> PB : finish("Edit text")
+PB --> ET : Option<CellPatchCommand>
+opt Some(cmd)
+  ET -> H : record_applied(cmd)
+end
+ET -> ET : cursor = None
+@enduml
+
+@startuml 13c_seq_fill
+!include _style.puml
+title Sequence - Fill cell
+autonumber
+
+actor User
+participant "CanvasView" as CV
+participant "ToolRegistry" as TR
+participant "FillCellTool" as FT
+participant "Selection" as Sel
+participant "FloodFill" as FF
+participant "PatchBuilder" as PB
+participant "Frame\n(selected)" as F
+participant "History" as H
+
+User -> CV : click on cell c
+CV -> TR : dispatch(PointerDown(c, mods))
+TR -> FT : on_event(PointerDown(c))
+FT -> Sel : is_empty() / contains(c)
+alt selection non-empty and c not inside
+  FT --> TR : Consumed   (nothing happens)
+else
+  FT -> F : grid.get(c)
+  F --> FT : seed cell
+  alt seed already has brush.paint in brush.channel
+    FT --> TR : Consumed   (nothing happens, nothing recorded)
+  else
+    FT -> FF : region(grid, c, brush.channel, &selection)
+    FF --> FT : Vec<CellCoord>   (see activity diagram 19a)
+    FT -> PB : new(frame_id)
+    loop for each cell k in region
+      FT -> PB : write(project, k, new)\nForeground: Cell{ fg: paint, ..old }   Background: Cell{ bg: Some(paint), ..old }
+      PB -> F : set_cell(k, new)
+    end
+    FT -> PB : finish("Fill cells")
+    PB --> FT : Some(CellPatchCommand)
+    FT -> H : record_applied(cmd)
+    FT --> TR : Consumed
+  end
+end
+@enduml

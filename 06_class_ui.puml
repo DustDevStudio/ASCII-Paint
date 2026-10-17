@@ -1,0 +1,516 @@
+@startuml 06a_class_app_shell
+!include _style.puml
+title UI (a) - application shell, screens, modals and actions - crate ascii_app
+
+package "ascii_app::app" {
+
+  class AsciiPaintApp <<struct, eframe::App>> {
+    - screen: AppScreen
+    - modal: Option<Modal>
+    - services: Services
+    - export_job: Option<ExportJobHandle>
+    - pending: Option<PendingAction>
+    + new(cc: &eframe::CreationContext) -> AsciiPaintApp
+    + update(ctx: &egui::Context, frame: &mut eframe::Frame)
+    - handle_action(a: AppAction)
+    - poll_export_job()
+    - on_close_requested() -> bool
+  }
+
+  class Services <<struct>> {
+    + recent: RecentStore
+    + projects: ProjectRepository
+    + exporter: ExportService
+    + glyphs: Arc<dyn GlyphSource>
+    + dialogs: FileDialogs
+    + clock: Clock
+  }
+
+  enum AppScreen <<enum>> {
+    Welcome(WelcomeScreen)
+    Editor(Box<EditorScreen>)
+  }
+
+  class FileDialogs <<struct, wraps rfd>> {
+    + pick_folder(start: &Path) -> Option<PathBuf>
+    + pick_file(extensions: &[&str]) -> Option<PathBuf>
+  }
+
+  class WelcomeScreen <<struct>> {
+    + ui(ui: &mut egui::Ui) -> Vec<AppAction>
+  }
+
+  enum PendingAction <<enum>> {
+    CloseProject
+    QuitApplication
+    OpenProjectFile(PathBuf)
+  }
+
+  enum AppAction <<enum>> {
+    OpenNewProjectModal
+    OpenRecentModal
+    CreateProject(NewProjectParams)
+    OpenProjectFile(PathBuf)
+    RemoveRecent(PathBuf)
+    ClearRecent
+    RequestCloseProject
+    OpenSaveModal
+    QuickSave
+    SaveAs(SaveRequest)
+    OpenColorPicker(ColorPickTarget)
+    ApplyColor(ColorPickTarget, Option<Rgb>, bool)
+    ConfirmUnsaved(UnsavedChoice)
+    CancelExport
+    CloseModal
+  }
+
+  enum ColorPickTarget <<enum>> {
+    PaintColor
+    EraseColor
+    FrameBackground(FrameId)
+  }
+
+  enum UnsavedChoice <<enum>> {
+    Save
+    Discard
+    Cancel
+  }
+
+  class NewProjectParams <<struct>> {
+    + name: String
+    + folder: PathBuf
+    + background: Rgb
+    + fps: Fps
+  }
+
+  class SaveRequest <<struct>> {
+    + format: SaveFormat
+    + path: PathBuf
+  }
+
+  enum SaveFormat <<enum>> {
+    ProjectAspr
+    FramePng
+    FrameAscii
+    AnimationAanim
+    AnimationMp4
+    + extension() -> &str
+    + scope() -> SaveScope
+    + label() -> &str
+  }
+
+  enum SaveScope <<enum>> {
+    Project
+    CurrentFrame
+    AllFrames
+  }
+}
+
+package "ascii_app::modals" {
+
+  interface ModalView <<trait>> {
+    + title() -> &str
+    + ui(ui: &mut egui::Ui) -> ModalOutcome
+  }
+
+  enum ModalOutcome <<enum>> {
+    Open
+    Cancelled
+    Accepted(AppAction)
+  }
+
+  enum Modal <<enum>> {
+    NewProject(NewProjectModal)
+    RecentProjects(RecentProjectsModal)
+    ColorPicker(ColorPickerModal)
+    Save(SaveModal)
+    ConfirmUnsaved(ConfirmUnsavedModal)
+    ExportProgress(ExportProgressModal)
+    Error(ErrorModal)
+  }
+
+  class NewProjectModal <<struct>> {
+    - name: String
+    - folder: PathBuf
+    - background: Rgb
+    - fps: Fps
+    - canvas: CanvasSpec
+    - error: Option<String>
+    + validate() -> Result<NewProjectParams, NewProjectError>
+  }
+
+  class RecentProjectsModal <<struct>> {
+    - rows: Vec<RecentRow>
+    - selected: Option<usize>
+  }
+
+  class RecentRow <<struct>> {
+    + entry: RecentEntry
+    + exists: bool
+  }
+
+  class ColorPickerModal <<struct>> {
+    - target: ColorPickTarget
+    - original: Option<Rgb>
+    - working: Option<Rgb>
+    - allow_transparent: bool
+    - apply_to_all: bool
+  }
+
+  class SaveModal <<struct>> {
+    - format: SaveFormat
+    - file_name: String
+    - folder: PathBuf
+    - ffmpeg_available: bool
+    - error: Option<String>
+    + validate() -> Result<SaveRequest, SaveFormError>
+  }
+
+  class ConfirmUnsavedModal <<struct>> {
+    - project_name: String
+  }
+
+  class ExportProgressModal <<struct>> {
+    - done: u32
+    - total: u32
+    - cancelling: bool
+  }
+
+  class ErrorModal <<struct>> {
+    - heading: String
+    - details: String
+  }
+}
+
+AsciiPaintApp *-- "1" AppScreen
+AsciiPaintApp *-- "0..1" Modal
+AsciiPaintApp *-- "1" Services
+AsciiPaintApp o-- "0..1" PendingAction
+AsciiPaintApp o-- "0..1" ExportJobHandle
+AppScreen *-- WelcomeScreen
+AppScreen *-- EditorScreen
+WelcomeScreen ..> AppAction : emits
+ModalView ..> ModalOutcome
+ModalOutcome ..> AppAction
+Modal *-- NewProjectModal
+Modal *-- RecentProjectsModal
+Modal *-- ColorPickerModal
+Modal *-- SaveModal
+Modal *-- ConfirmUnsavedModal
+Modal *-- ExportProgressModal
+Modal *-- ErrorModal
+ModalView <|.. NewProjectModal
+ModalView <|.. RecentProjectsModal
+ModalView <|.. ColorPickerModal
+ModalView <|.. SaveModal
+ModalView <|.. ConfirmUnsavedModal
+ModalView <|.. ExportProgressModal
+ModalView <|.. ErrorModal
+RecentProjectsModal *-- "0..10" RecentRow
+NewProjectModal ..> NewProjectParams : produces
+SaveModal ..> SaveRequest : produces
+SaveRequest *-- SaveFormat
+SaveFormat ..> SaveScope
+AppAction ..> NewProjectParams
+AppAction ..> SaveRequest
+AppAction ..> ColorPickTarget
+AppAction ..> UnsavedChoice
+ColorPickerModal *-- ColorPickTarget
+Services ..> ProjectRepository
+Services ..> FileDialogs
+Services ..> RecentStore
+Services ..> ExportService
+
+note as N1
+  update() order (runs every egui frame)
+  1. poll_export_job(): drain the worker channel, update ExportProgressModal, on Finished/Failed close it and (Failed) open ErrorModal.
+  2. If screen is Editor: playback.tick(now) (may change the selected frame, then ctx.request_repaint_after(next_deadline)).
+  3. Draw the current screen (WelcomeScreen::ui or EditorScreen::ui) -> Vec<AppAction> (blocked from input while a modal is open).
+  4. Draw the modal (if any) centred, with a dimming layer over the screen. ModalOutcome::Accepted(action) / Cancelled closes it.
+  5. for each AppAction collected in 3 and 4 -> handle_action(). Actions never run inside the draw code (no re-entrancy).
+  on_close_requested(): if Editor and session.history.is_dirty() -> cancel the OS close, pending = QuitApplication,
+  open ConfirmUnsavedModal; otherwise allow the close. If an export job is running: set its cancel flag, join the worker, then allow the close.
+  Only ONE modal exists at a time. Opening a modal while one is open replaces it, EXCEPT ErrorModal which is shown
+  after the current modal is closed (it replaces the current one only when the current one is NewProject/Save and the
+  error came from its own action).
+end note
+
+note as N2
+  - original / working: Option<Rgb>. None means "transparent" and is only offered when allow_transparent (= EraseColor target).
+  - UI: RGB sliders 0-255, hex field (#RRGGBB, validated live with Rgb::from_hex), 16 preset swatches, old/new preview.
+  - "Apply to all frames" checkbox is only shown for ColorPickTarget::FrameBackground.
+  - OK -> Accepted(ApplyColor(target, working, apply_to_all)).  Cancel / Esc -> Cancelled (nothing changes).
+end note
+
+note as N3
+  Fields and validation (validate() runs when Create is pressed; the Create button is disabled while the form is invalid)
+  - name: trimmed, 1..=64 chars, none of  / \ : * ? " < > |  and not ending with '.' or ' '. Default "Untitled".
+  - folder: must exist and be writable. Default = <Documents>/AsciiPaint (created if missing). "Browse..." uses a native folder dialog.
+  - target file = folder/name.aspr must NOT exist -> error "A project with this name already exists in this folder."
+  - background: initial background colour of frame 1 (default #000000), edited with the same ColorPickerModal-style widget inline.
+  - fps: 1..=60 (default 12).
+  - canvas: shown read-only as "240 x 72 cells - 8 x 15 px" (not editable in this milestone).
+end note
+
+note as N4
+  - Format list grouped by scope:  Project: .aspr  |  Current frame: .png, .ascii  |  All frames: .aanim, .mp4.
+  - AnimationMp4 is disabled (greyed, tooltip "ffmpeg not found") when FfmpegLocator::find() returned None.
+  - Default file name = project name (+ "_frame" + 3-digit 1-based index for FramePng / FrameAscii); extension follows the format.
+  - Save is enabled when folder exists, file_name is a valid file name (same rules as project name) .
+  - If the file already exists a confirmation line "File exists - it will be replaced" is shown (no extra dialog).
+end note
+
+
+' ---- rule notes: attached to their class, stacked in one column (hidden links) ----
+AsciiPaintApp .. N1
+ColorPickerModal .. N2
+NewProjectModal .. N3
+SaveModal .. N4
+N1 -[hidden]down-> N2
+N2 -[hidden]down-> N3
+N3 -[hidden]down-> N4
+@enduml
+
+@startuml 06b_class_editor_screen
+!include _style.puml
+title UI (b) - editor screen, session and canvas - crate ascii_app::editor
+
+package "ascii_app::editor" {
+
+  class EditorScreen <<struct>> {
+    - session: EditorSession
+    - menu: MenuBar
+    - tool_panel: ToolPanel
+    - canvas: CanvasView
+    - frame_panel: FramePanel
+    - status: StatusBar
+    + new(project: Project, path: PathBuf, glyphs: Arc<dyn GlyphSource>) -> EditorScreen
+    + ui(ctx: &egui::Context) -> Vec<AppAction>
+    + handle_shortcuts(ctx: &egui::Context) -> Vec<AppAction>
+  }
+
+  class EditorSession <<struct>> {
+    + project: Project
+    + path: PathBuf
+    + history: History
+    + selection: Selection
+    + tools: ToolRegistry
+    + brush: Brush
+    + viewport: Viewport
+    + playback: PlaybackController
+    + thumbnails: ThumbnailCache
+    + show_grid: bool
+    + is_dirty() -> bool
+    + set_tool(id: ToolId)
+    + set_paint_color(c: Rgb)
+    + set_erase_color(c: Option<Rgb>)
+    + set_channel(ch: PaintChannel)
+    + select_frame(i: usize)
+    + add_frame()
+    + duplicate_frame()
+    + delete_frame()
+    + move_frame(from: usize, to: usize)
+    + set_frame_background(id: FrameId, c: Rgb, all_frames: bool)
+    + set_fps(f: Fps)
+    + set_looping(on: bool)
+    + undo()
+    + redo()
+    + delete_selection_contents()
+    + toggle_playback(now: Instant)
+  }
+
+  class MenuBar <<struct>> {
+    + ui(ui: &mut egui::Ui, s: &mut EditorSession) -> Vec<AppAction>
+  }
+
+  class ToolPanel <<struct>> {
+    + ui(ui: &mut egui::Ui, s: &mut EditorSession) -> Vec<AppAction>
+  }
+
+  class FramePanel <<struct>> {
+    - drag: Option<FrameDrag>
+    + ui(ui: &mut egui::Ui, s: &mut EditorSession) -> Vec<AppAction>
+  }
+
+  class FrameDrag <<struct>> {
+    + from: usize
+    + hover_slot: usize
+  }
+
+  class StatusBar <<struct>> {
+    + ui(ui: &mut egui::Ui, s: &EditorSession, hover: Option<CellCoord>)
+  }
+
+  class CanvasView <<struct>> {
+    - hover: Option<CellCoord>
+    - space_pan: bool
+    - renderer: CanvasRenderer
+    + ui(ui: &mut egui::Ui, s: &mut EditorSession) -> Option<CellCoord>
+    - translate_input(ui: &egui::Ui, s: &EditorSession) -> Vec<ToolEvent>
+  }
+
+  class CanvasRenderer <<struct>> {
+    - atlas: GlyphAtlas
+    - edges_cache: Option<(u64, Vec<EdgeSegment>)>
+    + paint(painter: &egui::Painter, rect: egui::Rect, s: &EditorSession)
+  }
+
+  class GlyphAtlas <<struct>> {
+    - texture: egui::TextureHandle
+    - slots: HashMap<char, u32>
+    - next_slot: u32
+    + new(ctx: &egui::Context, src: Arc<dyn GlyphSource>) -> GlyphAtlas
+    + uv(ch: char) -> egui::Rect
+    - rebuild()
+  }
+
+  class Viewport <<struct>> {
+    + zoom: f32
+    + origin: egui::Vec2
+    + {static} MIN_ZOOM: f32 = 0.1
+    + {static} MAX_ZOOM: f32 = 16.0
+    + {static} WHEEL_STEP: f32 = 1.1
+    + screen_to_cell(p: egui::Pos2, canvas: &CanvasSpec) -> Option<CellCoord>
+    + screen_to_cell_clamped(p: egui::Pos2, canvas: &CanvasSpec) -> CellCoord
+    + cell_rect(c: CellCoord, canvas: &CanvasSpec) -> egui::Rect
+    + visible_cells(view: egui::Rect, canvas: &CanvasSpec) -> CellRect
+    + zoom_at(cursor: egui::Pos2, notches: f32)
+    + zoom_step(direction: i32, view: egui::Rect)
+    + pan_by(delta: egui::Vec2, view: egui::Rect, canvas: &CanvasSpec)
+    + fit(view: egui::Rect, canvas: &CanvasSpec)
+    + actual_size(view: egui::Rect, canvas: &CanvasSpec)
+  }
+
+  class PlaybackController <<struct>> {
+    - state: PlaybackState
+    - last_advance: Option<Instant>
+    + state() -> PlaybackState
+    + play(now: Instant)
+    + pause()
+    + tick(now: Instant, tl: &mut Timeline) -> Option<Duration>
+  }
+
+  enum PlaybackState <<enum>> {
+    Stopped
+    Playing
+  }
+
+  class ThumbnailCache <<struct>> {
+    - entries: HashMap<FrameId, ThumbEntry>
+    + get(ctx: &egui::Context, f: &Frame) -> &egui::TextureHandle
+    + retain_only(ids: &[FrameId])
+  }
+
+  class ThumbEntry <<struct>> {
+    + revision: u64
+    + texture: egui::TextureHandle
+  }
+}
+
+EditorScreen *-- EditorSession
+EditorScreen *-- MenuBar
+EditorScreen *-- ToolPanel
+EditorScreen *-- CanvasView
+EditorScreen *-- FramePanel
+EditorScreen *-- StatusBar
+EditorSession *-- Project
+EditorSession *-- History
+EditorSession *-- Selection
+EditorSession *-- ToolRegistry
+EditorSession *-- Brush
+EditorSession *-- Viewport
+EditorSession *-- PlaybackController
+EditorSession *-- ThumbnailCache
+PlaybackController *-- PlaybackState
+ThumbnailCache *-- "0..*" ThumbEntry
+FramePanel *-- "0..1" FrameDrag
+CanvasView *-- CanvasRenderer
+CanvasRenderer *-- GlyphAtlas
+CanvasRenderer ..> Viewport : uses
+CanvasView ..> ToolEvent : produces
+CanvasView ..> ToolRegistry : dispatch()
+MenuBar ..> EditorSession
+ToolPanel ..> EditorSession
+FramePanel ..> EditorSession
+
+note as N1
+  EditorSession is the single source of truth while a project is open. UI widgets mutate it ONLY through these methods.
+  - add_frame()/duplicate_frame()/delete_frame()/move_frame(): build the matching Command (05), history.execute(), stop playback.
+  - set_frame_background(id, c, all_frames): all_frames=false -> SetFrameBackgroundCommand (skipped when colour unchanged);
+      all_frames=true -> CompositeCommand of one SetFrameBackgroundCommand per differing frame. history.execute().
+  - set_fps() / set_looping(): SetPlaybackSettingsCommand. select_frame(i): timeline.select(i) (not undoable), keeps the selection mask.
+  - undo()/redo(): see History rules; they also stop playback first.
+  - delete_selection_contents(): when selection is non-empty, clears every selected cell of the current frame
+      with ClearOperation inside ONE PatchBuilder ("Clear selection").
+  - toggle_playback(): see state diagram 11 (playback). Starting playback cancels any busy tool.
+end note
+
+note as N2
+  Geometry (page = canvas.pixel_width x canvas.pixel_height "page pixels", origin = screen position of the page top-left
+  relative to the canvas widget's top-left)
+  - page_px = (screen - view.min - origin) / zoom
+  - cell    = (floor(page_px.x / cell_w), floor(page_px.y / cell_h)); None when outside 0..cols / 0..rows.
+  - cell_rect(c) = [origin + (c.col*cell_w, c.row*cell_h)*zoom, size (cell_w, cell_h)*zoom] in widget coordinates.
+  - zoom_at(cursor, notches): z' = clamp(zoom * WHEEL_STEP^notches, MIN_ZOOM, MAX_ZOOM);
+      origin' = (cursor - view.min) - ((cursor - view.min) - origin) * (z' / zoom); zoom = z'.   (point under cursor stays fixed)
+  - pan_by(d): origin += d, then clamp so that at least 64 screen px of the page stay visible on each axis.
+  - fit(): zoom = clamp(min(view.w / page_w, view.h / page_h) * 0.95, MIN, MAX); page centred in the view.
+  - actual_size(): zoom = 1.0 (1 page pixel = 1 screen pixel); page centred.
+  - zoom_step(+1/-1): z' = clamp(zoom * 1.25^dir) around the view centre. A new Editor opens with fit().
+end note
+
+note as N3
+  Input mapping (translate_input)
+  - Mouse wheel over the canvas = zoom_at(cursor, scroll_y / 50.0). (Never scrolls.)
+  - Middle-button drag, or Space held + left drag = pan_by(drag delta). Space-pan suppresses tool events.
+  - Primary button -> ToolEvent::PointerDown / PointerMove / PointerUp / DoubleClick with cell = screen_to_cell(...).
+  - Typed text (egui Event::Text, printable only) -> ToolEvent::Text; Enter/Backspace/Delete/Arrows/Escape -> ToolEvent::Key.
+    Only when the canvas has keyboard focus (clicking the canvas gives focus; text fields elsewhere take it away).
+  - Returns the hovered cell for the StatusBar.
+  - Painting order: see CanvasRenderer note.
+end note
+
+note as N4
+  paint() draw order (only the cells returned by Viewport::visible_cells are visited)
+  1. Dark neutral workspace fill (#2B2B2B) over the whole widget.
+  2. PAGE: filled rect with timeline.selected_frame().background.
+  3. For each visible cell: if bg = Some(c) fill cell rect with c.
+  4. For each visible cell with glyph != ' ': textured quad from GlyphAtlas::uv(glyph), tinted with fg.
+  5. Grid lines (1 px, white at 12% opacity) when show_grid && zoom >= 2.0.
+  6. Selection: boundary_edges() (cached by Selection::revision) as 1.5 px dashed black/white "marching ants".
+  7. Tool overlay: text cursor (blinking 500 ms), rect/ellipse preview, polygon rubber-band, hovered-cell outline.
+  8. Page border (1 px #000000 at 60%).
+  While Playing, steps 6-7 are skipped. The glyph cache key is only the char, the colour is applied by the vertex tint.
+end note
+
+note as N5
+  tick(now, tl) -> Option<Duration> = time until the next frame change (for ctx.request_repaint_after) or None when Stopped.
+  See the Playback state machine (11) for the exact transitions.
+end note
+
+note as N6
+  Layout (top to bottom): header "Frames" | scrollable list of FrameItem | [+ Add] [Duplicate] [Delete] |
+  separator | "Background" swatch + hex text of the SELECTED frame | FPS field | [Play/Pause] [x] Loop.
+  - FrameItem = 1-based index label + thumbnail (ThumbnailCache) + highlight when selected. Click = select_frame(i).
+  - Drag a FrameItem: FrameDrag{from, hover_slot}; on release, if hover_slot != from -> move_frame(from, to).
+  - Delete is disabled when timeline.len() == 1. Add inserts AFTER the selected frame and selects it.
+  - Background swatch click -> AppAction::OpenColorPicker(ColorPickTarget::FrameBackground(selected frame id)).
+    The hex field commits on Enter / focus loss (valid #RRGGBB only, otherwise reverts) via set_frame_background(id, c, false).
+  - FPS = DragValue 1..=60 integer, commits via set_fps() (Enter / focus loss / drag release). Loop checkbox -> set_looping().
+  - All edit buttons are disabled while Playing, except Play/Pause itself and frame selection (which stops playback).
+end note
+
+
+' ---- rule notes: attached to their class, stacked in one column (hidden links) ----
+EditorSession .. N1
+Viewport .. N2
+CanvasView .. N3
+CanvasRenderer .. N4
+PlaybackController .. N5
+FramePanel .. N6
+N1 -[hidden]down-> N2
+N2 -[hidden]down-> N3
+N3 -[hidden]down-> N4
+N4 -[hidden]down-> N5
+N5 -[hidden]down-> N6
+@enduml

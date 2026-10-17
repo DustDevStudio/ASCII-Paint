@@ -1,0 +1,212 @@
+@startuml 03_class_domain
+!include _style.puml
+title Domain model - crate ascii_core::model (pure data, no UI / IO dependencies)
+
+legend top right
+  Notation: + pub, - private. <<struct>>, <<enum>>, <<trait>> are Rust kinds.
+  Types use Rust syntax. "persisted" = written to .aspr / .ascii / .aanim.
+end legend
+
+package "ascii_core::model" {
+
+  class Rgb <<struct, Copy, Eq, Hash>> {
+    + r: u8
+    + g: u8
+    + b: u8
+    + {static} BLACK: Rgb
+    + {static} WHITE: Rgb
+    + {static} from_hex(s: &str) -> Result<Rgb, ColorParseError>
+    + to_hex() -> String
+    + to_rgba(alpha: u8) -> [u8; 4]
+  }
+
+  class CellCoord <<struct, Copy, Eq, Hash, Ord>> {
+    + col: u16
+    + row: u16
+  }
+
+  class CellRect <<struct, Copy, Eq>> {
+    + min: CellCoord
+    + max: CellCoord
+    + {static} from_corners(a: CellCoord, b: CellCoord) -> CellRect
+    + width() -> u16
+    + height() -> u16
+    + contains(c: CellCoord) -> bool
+    + iter() -> impl Iterator<Item = CellCoord>
+  }
+
+  class CanvasSpec <<struct, Copy, Eq>> {
+    + cols: u16
+    + rows: u16
+    + cell_w: u8
+    + cell_h: u8
+    + {static} DEFAULT_COLS: u16 = 240
+    + {static} DEFAULT_ROWS: u16 = 72
+    + {static} DEFAULT_CELL_W: u8 = 8
+    + {static} DEFAULT_CELL_H: u8 = 15
+    + {static} default() -> CanvasSpec
+    + pixel_width() -> u32
+    + pixel_height() -> u32
+    + cell_count() -> usize
+    + contains(c: CellCoord) -> bool
+    + clamp(col: i32, row: i32) -> CellCoord
+  }
+
+  class Cell <<struct, Copy, Eq>> {
+    + glyph: char
+    + fg: Rgb
+    + bg: Option<Rgb>
+    + {static} EMPTY: Cell
+    + is_blank() -> bool
+  }
+
+  class Grid <<struct, Clone>> {
+    - cols: u16
+    - rows: u16
+    - cells: Vec<Cell>
+    + {static} blank(spec: &CanvasSpec) -> Grid
+    + cols() -> u16
+    + rows() -> u16
+    + get(c: CellCoord) -> Option< &Cell>
+    + set(c: CellCoord, cell: Cell) -> Option<Cell>
+    + iter() -> impl Iterator<Item = (CellCoord, &Cell)>
+    - index(c: CellCoord) -> usize
+  }
+
+  class FrameId <<struct, Copy, Eq, Hash>> {
+    + 0: u64
+  }
+
+  class Frame <<struct, Clone>> {
+    + id: FrameId
+    + background: Rgb
+    + grid: Grid
+    - revision: u64
+    + {static} blank(id: FrameId, spec: &CanvasSpec, background: Rgb) -> Frame
+    + duplicate_as(new_id: FrameId) -> Frame
+    + set_cell(c: CellCoord, cell: Cell) -> Option<Cell>
+    + set_background(bg: Rgb) -> Rgb
+    + revision() -> u64
+    - touch()
+  }
+
+  class Fps <<struct, Copy, Eq>> {
+    + 0: u8
+    + {static} MIN: u8 = 1
+    + {static} MAX: u8 = 60
+    + {static} DEFAULT: Fps = Fps(12)
+    + {static} new(v: u8) -> Result<Fps, DomainError>
+    + frame_duration() -> Duration
+  }
+
+  class Timeline <<struct>> {
+    - frames: Vec<Frame>
+    - selected: usize
+    + fps: Fps
+    + looping: bool
+    + len() -> usize
+    + frame(i: usize) -> Option< &Frame>
+    + frame_mut(i: usize) -> Option< &mut Frame>
+    + selected_index() -> usize
+    + selected_frame() -> &Frame
+    + selected_frame_mut() -> &mut Frame
+    + select(i: usize) -> Result<(), DomainError>
+    + index_of(id: FrameId) -> Option<usize>
+    + insert(i: usize, f: Frame)
+    + remove(i: usize) -> Result<Frame, DomainError>
+    + move_frame(from: usize, to: usize) -> Result<(), DomainError>
+    + frames() -> &[Frame]
+  }
+
+  class ProjectMeta <<struct, Clone>> {
+    + name: String
+    + created_at: i64
+    + modified_at: i64
+    + app_version: String
+  }
+
+  class Project <<struct>> {
+    + meta: ProjectMeta
+    + canvas: CanvasSpec
+    + timeline: Timeline
+    - next_frame_id: u64
+    + {static} new(name: String, background: Rgb, fps: Fps, now: i64) -> Project
+    + alloc_frame_id() -> FrameId
+    + touch_modified(now: i64)
+  }
+
+  enum DomainError <<enum>> {
+    IndexOutOfRange
+    CannotRemoveLastFrame
+    InvalidFps
+    InvalidCanvas
+    InvalidName
+  }
+}
+
+Project *-- "1" ProjectMeta
+Project *-- "1" CanvasSpec
+Project *-- "1" Timeline
+Timeline *-- "1..*  (ordered)" Frame : frames
+Frame *-- "1" Grid
+Frame *-- "1" Rgb : background
+Frame *-- "1" FrameId
+Timeline *-- "1" Fps
+Grid *-- "cols x rows" Cell : row-major
+Cell *-- "1" Rgb : fg
+Cell o-- "0..1" Rgb : bg
+CellRect ..> CellCoord
+Grid ..> CellCoord : addressed by
+Project ..> DomainError : <<throws>>
+
+note right of Rgb
+  Colors carry NO alpha anywhere in the model.
+  "Transparent" is expressed only by Option::None on Cell.bg.
+end note
+
+note right of Cell
+  Semantics
+  - glyph: any Unicode scalar. ' ' (space) = blank glyph.
+  - fg: colour of the glyph pixels. Default Rgb::WHITE.
+  - bg: Some(c) = cell is filled with c.
+        None   = cell is transparent, the FRAME BACKGROUND shows through.
+  - Cell::EMPTY = { glyph: ' ', fg: WHITE, bg: None }
+  - is_blank() = glyph == ' ' && bg.is_none()
+end note
+
+note bottom of Grid
+  Invariants
+  - cells.len() == cols as usize * rows as usize
+  - index(c) = c.row as usize * cols as usize + c.col as usize
+  - get() returns None when c is out of bounds. set() returns None and does nothing when out of bounds,
+    otherwise returns the previous Cell (used by commands to record "before").
+  - All frames of a project share the same cols/rows (= Project.canvas).
+end note
+
+note bottom of Frame
+  Frame background (user-editable per frame)
+  - background is an OPAQUE Rgb. Default for a new project = Rgb::BLACK (chosen in New Project modal).
+  - Add frame      : new frame background = background of the currently selected frame.
+  - Duplicate frame: copy of the source frame (grid AND background) with a fresh FrameId.
+  - set_background returns the previous colour (recorded by SetFrameBackgroundCommand) and calls touch().
+  - revision is NOT persisted. It is bumped by touch() on every mutation (set_cell, set_background);
+    thumbnails and the canvas renderer compare it to know when to redraw.
+end note
+
+note bottom of Timeline
+  Invariants
+  - frames.len() >= 1 at all times (remove() on the last frame returns CannotRemoveLastFrame).
+  - selected < frames.len().
+  - insert(i, f): i in 0..=len. remove(i): i in 0..len.
+  - After insert(i, _)  : selected is unchanged by Timeline itself; the calling Command sets it.
+  - move_frame(from,to) : removes at `from` then inserts at `to` (to is the index AFTER removal).
+  - Frame order in the Vec is the playback order. FrameId is stable, the index is not.
+end note
+
+note bottom of Project
+  Project.new() creates exactly ONE blank frame (id 1, background = given colour), selected = 0.
+  next_frame_id starts at 2 and only ever increases (never reused after delete / undo).
+  CanvasSpec is fixed at creation in this milestone (240 x 72 cells, 8 x 15 px).
+end note
+
+@enduml

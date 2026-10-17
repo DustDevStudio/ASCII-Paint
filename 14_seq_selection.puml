@@ -1,0 +1,160 @@
+@startuml 14a_seq_shape_select
+!include _style.puml
+title Sequence - Square select / Ellipse select (drag)
+autonumber
+
+actor User
+participant "CanvasView" as CV
+participant "ToolRegistry" as TR
+participant "ShapeSelectTool<S>" as T
+participant "ShapeRasterizer" as SR
+participant "Selection" as Sel
+participant "CanvasRenderer" as R
+
+User -> CV : primary button down at cell a  (Shift held = Add, Alt held = Subtract, none = Replace)
+CV -> TR : dispatch(PointerDown(a, mods))
+TR -> T : on_event(PointerDown(a, mods))
+T -> T : drag = DragState{ anchor: a, current: a, mode: mods.selection_mode() }
+
+loop pointer moves while the button is held
+  User -> CV : move
+  CV -> TR : dispatch(PointerMove(cell))
+  TR -> T : on_event(PointerMove(cell))
+  T -> T : current = cell  (or clamp(last position) when the pointer left the page)
+  CV -> T : overlay()
+  T --> CV : RectPreview / EllipsePreview(CellRect::from_corners(anchor, current), mode)
+  CV -> R : paint(...) draws the preview outline (the selection itself is NOT changed yet)
+end
+
+alt User releases the button
+  User -> CV : primary button up
+  CV -> TR : dispatch(PointerUp(cell))
+  TR -> T : on_event(PointerUp(cell))
+  T -> SR : shape.rasterize(anchor, current, spec)\n(rect(...) or ellipse(...), see activity 19b)
+  SR --> T : Vec<CellCoord>  (clipped to the page)
+  T -> Sel : apply(cells, mode)
+  Sel -> Sel : Replace: clear then insert / Add: insert / Subtract: remove;  revision += 1
+  T -> T : drag = None
+else User presses Escape while dragging
+  User -> CV : Escape
+  CV -> TR : dispatch(Key(Escape))
+  TR -> T : on_event(Key(Escape))
+  T -> T : drag = None   (selection unchanged)
+end
+
+... next egui frame ...
+R -> Sel : revision()
+alt revision changed since edges_cache
+  R -> Sel : boundary_edges()
+  Sel --> R : Vec<EdgeSegment>
+  R -> R : edges_cache = (revision, edges)
+end
+R -> R : draw dashed "marching ants" along every edge
+@enduml
+
+@startuml 14b_seq_polygon_select
+!include _style.puml
+title Sequence - Polygon select
+autonumber
+
+actor User
+participant "CanvasView" as CV
+participant "ToolRegistry" as TR
+participant "SelectPolygonTool" as T
+participant "ShapeRasterizer" as SR
+participant "Selection" as Sel
+
+User -> CV : click cell v1  (Shift = Add, Alt = Subtract, none = Replace)
+CV -> TR : dispatch(PointerDown(v1, mods))
+TR -> T : on_event(PointerDown(v1, mods))
+T -> T : vertices = [v1]; mode = mods.selection_mode()
+
+loop add vertices
+  User -> CV : move pointer
+  CV -> TR : dispatch(PointerMove(cell))
+  TR -> T : on_event(PointerMove(cell))
+  T -> T : hover = cell   (overlay draws the rubber-band edge last vertex -> hover)
+  User -> CV : click cell vN
+  CV -> TR : dispatch(PointerDown(vN, mods))
+  TR -> T : on_event(PointerDown(vN))
+  alt vN == last vertex
+    T -> T : ignored
+  else vN == vertices[0] and vertices.len() >= 3
+    T -> T : close()   (see below)
+  else vN == vertices[0] and vertices.len() < 3
+    T -> T : ignored
+  else
+    T -> T : vertices.push(vN)
+  end
+  opt User presses Backspace
+    User -> CV : Backspace
+    CV -> TR : dispatch(Key(Backspace))
+    TR -> T : on_event(Key(Backspace))
+    T -> T : vertices.pop()   (empty -> tool idle)
+  end
+end
+
+alt User double-clicks, or presses Enter
+  User -> CV : double-click (or Enter)
+  CV -> TR : dispatch(DoubleClick(cell)) / dispatch(Key(Enter))
+  TR -> T : on_event(...)
+  T -> T : close()
+else User presses Escape
+  CV -> TR : dispatch(Key(Escape))
+  TR -> T : on_event(Key(Escape))
+  T -> T : vertices.clear()   (selection unchanged)
+end
+
+group close()
+  alt vertices.len() < 3
+    T -> T : vertices.clear()   (nothing selected)
+  else
+    T -> SR : polygon(vertices, spec)   (even-odd scanline at cell centres + Bresenham outline, see 19b)
+    SR --> T : Vec<CellCoord>
+    T -> Sel : apply(cells, mode)
+    T -> T : vertices.clear()
+  end
+end
+@enduml
+
+@startuml 14c_seq_selection_shortcuts
+!include _style.puml
+title Sequence - Selection keyboard shortcuts (handled by EditorScreen, not by a tool)
+autonumber
+
+actor User
+participant "EditorScreen" as E
+participant "EditorSession" as S
+participant "Selection" as Sel
+participant "ToolRegistry" as TR
+participant "PatchBuilder" as PB
+participant "History" as H
+
+User -> E : Ctrl+A
+E -> Sel : select_all()
+User -> E : Ctrl+D  (or Esc when no tool is busy)
+E -> TR : active().is_busy() ?
+alt not busy
+  E -> Sel : clear()
+else busy (Esc goes to the tool as Cancel instead)
+  E -> TR : dispatch(Cancel)
+end
+
+User -> E : Delete  [no EditCell session active]
+E -> S : delete_selection_contents()
+alt selection.is_empty()
+  S --> E : nothing happens
+else
+  S -> PB : new(selected frame id)
+  loop for each selected cell k (row-major order)
+    S -> PB : write(project, k, ClearOperation.apply(old, brush))   (glyph ' ', fg WHITE, bg = brush.erase)
+  end
+  S -> PB : finish("Clear selection")
+  PB --> S : Option<CellPatchCommand>
+  S -> H : record_applied(cmd)   (when Some)
+end
+note over E, H
+  When the EditCell tool has a cursor, Delete is delivered to the tool (clears ONE glyph) instead.
+  The selection mask itself stays unchanged after "Clear selection".
+end note
+@enduml

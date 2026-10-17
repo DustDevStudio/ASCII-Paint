@@ -1,0 +1,187 @@
+@startuml 05_class_commands
+!include _style.puml
+title Undo / redo - Command pattern - crate ascii_core::history
+
+package "ascii_core::history" {
+
+  interface Command <<trait>> {
+    + label() -> &str
+    + apply(project: &mut Project)
+    + revert(project: &mut Project)
+  }
+
+  class History <<struct>> {
+    - undo_stack: Vec<Box<dyn Command>>
+    - redo_stack: Vec<Box<dyn Command>>
+    - limit: usize = 200
+    - clean_marker: Option<usize>
+    + new() -> History
+    + execute(cmd: Box<dyn Command>, project: &mut Project)
+    + record_applied(cmd: Box<dyn Command>)
+    + undo(project: &mut Project) -> Option<String>
+    + redo(project: &mut Project) -> Option<String>
+    + can_undo() -> bool
+    + can_redo() -> bool
+    + undo_label() -> Option< &str >
+    + redo_label() -> Option< &str >
+    + mark_clean()
+    + is_dirty() -> bool
+  }
+
+  class CellChange <<struct, Copy>> {
+    + coord: CellCoord
+    + before: Cell
+    + after: Cell
+  }
+
+  class CellPatchCommand <<struct>> {
+    + frame_id: FrameId
+    + changes: Vec<CellChange>
+    + label: String
+  }
+
+  class SetFrameBackgroundCommand <<struct>> {
+    + frame_id: FrameId
+    + before: Rgb
+    + after: Rgb
+    + {static} new(project: &Project, frame_id: FrameId, after: Rgb) -> Option<SetFrameBackgroundCommand>
+  }
+
+  class AddFrameCommand <<struct>> {
+    + index: usize
+    + frame: Frame
+    + selected_before: usize
+    + {static} blank_after(project: &mut Project, index: usize) -> AddFrameCommand
+    + {static} duplicate(project: &mut Project, index: usize) -> AddFrameCommand
+  }
+
+  class DeleteFrameCommand <<struct>> {
+    + index: usize
+    + frame: Frame
+    + selected_before: usize
+    + {static} new(project: &Project, index: usize) -> Result<DeleteFrameCommand, DomainError>
+  }
+
+  class MoveFrameCommand <<struct>> {
+    + from: usize
+    + to: usize
+    + selected_before: usize
+  }
+
+  class SetPlaybackSettingsCommand <<struct>> {
+    + before_fps: Fps
+    + after_fps: Fps
+    + before_looping: bool
+    + after_looping: bool
+  }
+
+  class CompositeCommand <<struct>> {
+    + label: String
+    + children: Vec<Box<dyn Command>>
+  }
+}
+
+Command <|.. CellPatchCommand
+Command <|.. SetFrameBackgroundCommand
+Command <|.. AddFrameCommand
+Command <|.. DeleteFrameCommand
+Command <|.. MoveFrameCommand
+Command <|.. SetPlaybackSettingsCommand
+Command <|.. CompositeCommand
+
+History o-- "0..200" Command : undo_stack
+History o-- "0..*" Command : redo_stack
+CompositeCommand *-- "1..*" Command : children
+CellPatchCommand *-- "1..*" CellChange
+CellPatchCommand ..> Project : mutates
+SetFrameBackgroundCommand ..> Project : mutates
+AddFrameCommand ..> Project : mutates
+DeleteFrameCommand ..> Project : mutates
+MoveFrameCommand ..> Project : mutates
+SetPlaybackSettingsCommand ..> Project : mutates
+
+note as N1
+  Contract
+  - apply() is only ever called when the project is in the exact state the command was created against
+    (History guarantees this by strict LIFO order), so apply()/revert() never need to validate or fail.
+  - apply() followed by revert() restores the project bit-for-bit (except Frame.revision, which only increases).
+  - Commands own all data they need (they never keep references into the project).
+  - Commands never touch Selection, Viewport, Brush or the file on disk.
+end note
+
+note as N2
+  Rules
+  - execute(cmd): cmd.apply(project); then record_applied(cmd).
+  - record_applied(cmd): used when the change is already in the project (strokes, typing).
+      1. redo_stack.clear()  - if clean_marker is Some(m) with m > undo_stack.len(), set clean_marker = None.
+      2. undo_stack.push(cmd)
+      3. if undo_stack.len() > limit: undo_stack.remove(0); clean_marker = clean_marker.and_then(|m| m.checked_sub(1))
+         (a marker that falls off the bottom becomes None = "always dirty").
+  - undo(): pop undo_stack, cmd.revert(project), push onto redo_stack, return Some(cmd.label()). None if empty.
+  - redo(): pop redo_stack, cmd.apply(project), push onto undo_stack, return Some(label). None if empty.
+  - mark_clean(): clean_marker = Some(undo_stack.len())   (called right after a successful save of the .aspr).
+  - is_dirty(): clean_marker != Some(undo_stack.len())    (a brand-new project starts with clean_marker = Some(0)).
+  - EditorSession::undo()/redo() always dispatches ToolEvent::Cancel to the active tool FIRST, so a running stroke / typing
+    session is committed (or a drag / polygon preview discarded) before the history is touched.
+end note
+
+note as N3
+  apply : idx = timeline.index_of(frame_id).unwrap(); for ch in changes (in order) frame.set_cell(ch.coord, ch.after);
+          then timeline.select(idx) so the user always SEES what was changed.
+  revert: same loop in REVERSE order writing ch.before; then timeline.select(idx).
+  Used by: Edit text, Clear cells, Paint cells, Fill cells, "Delete selection contents".
+end note
+
+note as N4
+  new(): returns None when the frame does not exist or its background already equals `after` (nothing to record).
+  apply : frame.set_background(after)    revert: frame.set_background(before)
+  "Apply to all frames" in the colour dialog = CompositeCommand("Set background (all frames)") containing one
+  SetFrameBackgroundCommand per frame whose colour differs, so one Ctrl+Z restores every frame.
+end note
+
+note as N5
+  blank_after(project, i): frame = Frame::blank(project.alloc_frame_id(), canvas, background of frame i); index = i + 1.
+  duplicate(project, i) : frame = frame[i].duplicate_as(project.alloc_frame_id());  index = i + 1.
+  selected_before = timeline.selected_index() at creation time.
+  apply : timeline.insert(index, frame.clone()); timeline.select(index)
+  revert: timeline.remove(index); timeline.select(min(selected_before, len - 1))
+end note
+
+note as N6
+  new() fails with CannotRemoveLastFrame when timeline.len() == 1 (the Delete button is also disabled then).
+  apply : timeline.remove(index); timeline.select(min(index, len - 1))
+  revert: timeline.insert(index, frame.clone()); timeline.select(selected_before)
+end note
+
+note as N7
+  Created by drag-and-drop in the frame list (from = dragged index, to = index after removal, see Timeline::move_frame).
+  Not created when from == to.
+  apply : timeline.move_frame(from, to); timeline.select(to)
+  revert: timeline.move_frame(to, from); timeline.select(selected_before)
+end note
+
+note as N8
+  Created when the FPS field or the Loop checkbox changes (one command per committed edit: Enter / focus loss / drag release
+  for FPS, one click for Loop - not one per keystroke). Not created when nothing differs.
+  apply : timeline.fps = after_fps; timeline.looping = after_looping
+  revert: timeline.fps = before_fps; timeline.looping = before_looping
+end note
+
+
+' ---- rule notes: attached to their class, stacked in one column (hidden links) ----
+Command .. N1
+History .. N2
+CellPatchCommand .. N3
+SetFrameBackgroundCommand .. N4
+AddFrameCommand .. N5
+DeleteFrameCommand .. N6
+MoveFrameCommand .. N7
+SetPlaybackSettingsCommand .. N8
+N1 -[hidden]down-> N2
+N2 -[hidden]down-> N3
+N3 -[hidden]down-> N4
+N4 -[hidden]down-> N5
+N5 -[hidden]down-> N6
+N6 -[hidden]down-> N7
+N7 -[hidden]down-> N8
+@enduml

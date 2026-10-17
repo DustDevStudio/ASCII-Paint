@@ -1,0 +1,122 @@
+@startuml 09a_state_application
+!include _style.puml
+title Application state machine (top level)
+
+[*] --> Booting
+
+state Booting {
+  Booting : entry / load default font (GlyphSource), open RecentStore, FfmpegLocator::find()
+}
+state StartupFailed
+StartupFailed : entry / show native error dialog (font missing or unreadable)
+StartupFailed : exit  / process ends
+
+state Welcome {
+  state WelcomeIdle
+  state NewProjectDialog
+  state RecentDialog
+  [*] --> WelcomeIdle
+  WelcomeIdle --> NewProjectDialog : click "Create new project"\n/ modal = NewProject (defaults)
+  WelcomeIdle --> RecentDialog : click "Open recent"\n/ modal = RecentProjects (entries checked with Path::exists)
+  NewProjectDialog --> WelcomeIdle : Cancel or Esc
+  RecentDialog --> WelcomeIdle : Close or Esc
+  NewProjectDialog --> NewProjectDialog : Create [form invalid]\n/ show field errors, stay open
+  NewProjectDialog --> NewProjectDialog : Create [valid] and save fails\n/ show ErrorModal text inline in the form
+  RecentDialog --> RecentDialog : Open [file missing or corrupt]\n/ ErrorModal, entry marked "missing" if NotFound
+}
+
+state Editor {
+  Editor : entry / viewport.fit(), tool = EditCell, paint = #FFFFFF, erase = transparent, history empty (clean)
+  Editor : exit  / stop playback, drop EditorSession (history, thumbnails, textures)
+}
+
+state ClosingFlow {
+  state ConfirmUnsaved
+  state SavingBeforeClose
+  ConfirmUnsaved : entry / pending = CloseProject or QuitApplication
+  ConfirmUnsaved --> SavingBeforeClose : choice = Save
+  SavingBeforeClose --> ConfirmUnsaved : save failed / ErrorModal, keep pending
+}
+
+Booting --> Welcome : resources loaded
+Booting --> StartupFailed : font load error
+StartupFailed --> [*]
+
+NewProjectDialog --> Editor : Create [valid and file written]\n/ RecentStore.touch, Services.projects.save, new EditorScreen
+RecentDialog --> Editor : Open [file decodes]\n/ RecentStore.touch, new EditorScreen
+Welcome --> [*] : window closed
+
+Editor --> [*] : window closed [history clean]
+Editor --> ConfirmUnsaved : window closed [dirty]\n/ cancel OS close, pending = QuitApplication
+Editor --> ConfirmUnsaved : File > Close project [dirty]\n/ pending = CloseProject
+Editor --> Welcome : File > Close project [clean]
+Editor --> ConfirmUnsaved : open another project from Recent [dirty]\n/ pending = OpenProjectFile(path)
+
+ConfirmUnsaved --> Editor : choice = Cancel
+ConfirmUnsaved --> Welcome : choice = Discard [pending = CloseProject]
+ConfirmUnsaved --> [*] : choice = Discard [pending = QuitApplication]
+ConfirmUnsaved --> Editor : choice = Discard [pending = OpenProjectFile]\n/ replace session with the loaded project
+SavingBeforeClose --> Welcome : save ok [pending = CloseProject]
+SavingBeforeClose --> [*] : save ok [pending = QuitApplication]
+SavingBeforeClose --> Editor : save ok [pending = OpenProjectFile]
+
+note right of Editor
+  Inside the Editor the Recent modal is reachable from File > Open recent... (same modal as on the Welcome screen).
+  Ctrl+S in the Editor never changes the screen state (see 09b and sequence 18).
+end note
+
+@enduml
+
+@startuml 09b_state_editor_modals
+!include _style.puml
+title Editor screen - modal dialog states (one modal at a time) and playback region
+
+state Editor {
+
+  state "Modal region" as ModalRegion {
+    state NoModal
+    state ColorPicking
+    state SaveDialog
+    state Exporting
+    state ErrorShown
+    state UnsavedPrompt
+
+    [*] --> NoModal
+
+    NoModal --> ColorPicking : click paint swatch / erase swatch / frame background swatch\n/ modal = ColorPicker(target, working = current colour)
+    ColorPicking --> NoModal : OK / ApplyColor(target, colour, apply_to_all)
+    ColorPicking --> NoModal : Cancel or Esc [nothing changes]
+
+    NoModal --> SaveDialog : File > Save as... / Export...\n/ ffmpeg re-checked
+    SaveDialog --> NoModal : Cancel or Esc
+    SaveDialog --> NoModal : Save [format = .aspr / .png / .ascii / .aanim] and write ok
+    SaveDialog --> ErrorShown : Save [write fails]
+    SaveDialog --> Exporting : Save [format = .mp4]\n/ start_mp4()
+    Exporting --> NoModal : Finished
+    Exporting --> NoModal : Cancelled [partial file deleted]
+    Exporting --> ErrorShown : Failed
+    ErrorShown --> NoModal : OK
+
+    NoModal --> UnsavedPrompt : close project / window close [dirty]
+    UnsavedPrompt --> NoModal : Cancel
+  }
+
+  --
+
+  state "Playback region" as PlaybackRegion {
+    state Stopped
+    state Playing
+    [*] --> Stopped
+    Stopped --> Playing : Play [timeline.len() > 1] and NoModal
+    Playing --> Stopped : Pause, edit command, undo/redo, frame clicked, any modal opened
+  }
+}
+
+note bottom of Editor
+  Rules
+  - While the Modal region is not NoModal the rest of the UI ignores input (dimmed layer) and playback is stopped.
+  - Esc closes ColorPicking / SaveDialog / UnsavedPrompt as Cancel. Esc does NOT close Exporting (use the Cancel button) or ErrorShown (use OK).
+  - The Playback region is detailed in diagram 11a.
+end note
+
+@enduml

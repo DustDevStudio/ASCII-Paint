@@ -1,0 +1,48 @@
+@startuml 17_seq_undo_redo
+!include _style.puml
+title Sequence - Undo / Redo
+autonumber
+
+actor User
+participant "EditorScreen" as E
+participant "EditorSession" as S
+participant "ToolRegistry" as TR
+participant "History" as H
+participant "Command" as C
+participant "Project" as P
+
+User -> E : Ctrl+Z  (Edit > Undo)   or   Ctrl+Y / Ctrl+Shift+Z  (Edit > Redo)
+E -> S : undo()  /  redo()
+S -> S : playback.pause()
+S -> TR : dispatch(Cancel)   (always; idempotent for idle tools)
+note right of TR
+  Cancel semantics (04): stroke -> commits what was painted; EditCell -> commits the typing session and hides the cursor;
+  rectangle / ellipse / polygon -> discards the preview. So the history is complete BEFORE the undo is performed.
+end note
+alt undo()
+  S -> H : undo(project)
+  alt undo_stack is empty
+    H --> S : None   (menu item is disabled, shortcut does nothing)
+  else
+    H -> C : pop; revert(project)
+    C -> P : restore previous state\n(cells / frame background / frame list / fps)
+    H -> H : redo_stack.push(cmd)
+    H --> S : Some(label)
+  end
+else redo()
+  S -> H : redo(project)
+  alt redo_stack is empty
+    H --> S : None
+  else
+    H -> C : pop; apply(project)
+    C -> P : re-apply
+    H -> H : undo_stack.push(cmd)
+    H --> S : Some(label)
+  end
+end
+S -> S : thumbnails.retain_only(ids); status bar shows "Undid: <label>" / "Redid: <label>" for 2 s
+note over H
+  Any NEW command (execute / record_applied) clears the redo stack.
+  Selection, zoom, tool and colours are not part of undo.
+end note
+@enduml

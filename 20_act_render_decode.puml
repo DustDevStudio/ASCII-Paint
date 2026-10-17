@@ -1,0 +1,98 @@
+@startuml 20a_act_render_frame
+!include _style.puml
+title Activity - FrameRasterizer::render(frame, canvas, glyphs)  (PNG export, MP4 export)
+
+start
+:W := canvas.cols * cell_w, H := canvas.rows * cell_h;
+:buf := RgbaBuffer(W, H) with EVERY pixel = (frame.background.r, .g, .b, 255);
+note right
+  This is where the frame background colour is applied: transparent cells (bg = None) simply keep it.
+end note
+
+repeat :for each cell (col, row) in row-major order;
+  :cell := frame.grid.get((col, row));
+  :x0 := col * cell_w, y0 := row * cell_h;
+  if (cell.bg is Some(c)) then (yes)
+    :fill the rectangle [x0, x0 + cell_w) x [y0, y0 + cell_h) with (c.r, c.g, c.b, 255);
+  endif
+  if (cell.glyph != ' ') then (yes)
+    :mask := glyphs.mask(cell.glyph)   (cell_w x cell_h alpha bytes);
+    :for each pixel (mx, my) with a := mask[my * cell_w + mx] > 0:
+      p := buf[x0 + mx, y0 + my],
+      p.rgb := (p.rgb * (255 - a) + cell.fg * a + 127) / 255   (per channel, integer maths);
+  endif
+repeat while (more cells?) is (yes)
+
+:return buf;
+stop
+
+note right
+  Cells whose glyph is ' ' and bg is None are skipped entirely (fast path: the buffer already holds the background).
+  Output is always opaque, which is what PNG (RGBA8) and ffmpeg (rgba -> yuv420p) expect.
+  Cost for 1920 x 1080: ~17 k cell visits, ~2 M pixel writes worst case; typically < 15 ms.
+end note
+@enduml
+
+@startuml 20b_act_decode_file
+!include _style.puml
+title Activity - Decoding a file (AsprCodec::decode; AsciiCodec / AanimCodec follow the same steps)
+
+start
+:bytes := file contents;
+if (bytes.len() >= 20?) then (no)
+  :return Err(Truncated);
+  stop
+endif
+if (magic == kind.magic()?) then (no)
+  :return Err(BadMagic);
+  stop
+endif
+if (1 <= version <= 1?) then (no)
+  :return Err(UnsupportedVersion(version));
+  stop
+endif
+if (flags & 0xFFFE == 0?) then (no)
+  :return Err(ReservedFlags(flags));
+  stop
+endif
+if (bytes.len() == 20 + stored_len?) then (no)
+  :return Err(Truncated) when shorter, Err(LengthMismatch) when longer;
+  stop
+endif
+if (uncompressed_len <= 512 MiB?) then (no)
+  :return Err(LengthMismatch);
+  stop
+endif
+if (flags.bit0 == 1?) then (yes)
+  :payload := zstd decode of bytes[20..] (output limited to uncompressed_len);
+  if (decode ok?) then (no)
+    :return Err(Compression(message));
+    stop
+  endif
+else (no)
+  :payload := bytes[20..];
+endif
+if (payload.len() == uncompressed_len?) then (no)
+  :return Err(LengthMismatch);
+  stop
+endif
+if (crc32(payload) == header.crc32?) then (no)
+  :return Err(CrcMismatch);
+  stop
+endif
+
+:r := ByteReader(payload);
+:canvas := CanvasHeader (cols, rows, cell_w, cell_h, font_name) - range checked, else InvalidField(name, range);
+:.aspr only: meta := ProjectMeta, header := ProjectHeader (fps, loop flag, selected_index, frame_count) - range checked;
+:frames := [];
+repeat :FrameBlockCodec::read(r, canvas, id = frames.len() + 1);
+  :push frame;
+repeat while (frames.len() < frame_count?) is (yes)
+if (r.remaining() == 0?) then (no)
+  :return Err(InvalidField("payload", "trailing bytes"));
+  stop
+endif
+:build Project { meta, canvas, timeline{ frames, selected = selected_index, fps, looping }, next_frame_id = frame_count + 1 };
+:return Ok(project);
+stop
+@enduml

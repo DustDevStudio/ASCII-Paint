@@ -1,0 +1,179 @@
+@startuml 08a_container_layout
+!include _style.puml
+title File formats (a) - common container used by .ascii, .aanim and .aspr  (all integers LITTLE-ENDIAN)
+
+class "ContainerHeader  (fixed 20 bytes)" as Header <<binary>> {
+  offset 0  | size 4 | magic            : [u8;4]   "ASCI" (.ascii) / "AANM" (.aanim) / "ASPR" (.aspr)
+  offset 4  | size 2 | version          : u16      = 1
+  offset 6  | size 2 | flags            : u16      bit0 = payload is zstd-compressed, bits 1..15 MUST be 0
+  offset 8  | size 4 | uncompressed_len : u32      length of the payload after decompression
+  offset 12 | size 4 | stored_len       : u32      number of bytes that follow the header
+  offset 16 | size 4 | crc32            : u32      CRC-32 (IEEE, crc32fast) of the UNCOMPRESSED payload
+}
+
+class "Payload  (stored_len bytes)" as Payload <<binary>> {
+  zstd level 3 stream when flags.bit0 = 1
+  raw bytes when flags.bit0 = 0 (stored_len == uncompressed_len)
+}
+
+class "File on disk" as File <<binary>>
+
+File *-- "1  @0" Header
+File *-- "1  @20" Payload
+
+note right of File
+  Extension <-> magic <-> payload content
+  .ascii : "ASCI" : CanvasHeader + 1 FrameBlock
+  .aanim : "AANM" : CanvasHeader + AnimHeader + N FrameBlock
+  .aspr  : "ASPR" : CanvasHeader + ProjectMeta + ProjectHeader + N FrameBlock
+  (payload layouts: diagram 08b, worked example: 08c)
+end note
+
+note bottom of Header
+  Writing (ContainerCodec::wrap)
+  1. crc = crc32(payload).  2. c = zstd(payload, level 3).
+  3. if c.len() < payload.len(): flags = 1, body = c  else: flags = 0, body = payload.
+  4. emit header (stored_len = body.len()), then body.
+
+  Reading (ContainerCodec::unwrap) - checks in THIS order, first failure wins
+  1. bytes.len() >= 20                        else Truncated
+  2. magic == expected magic of the requested FileKind   else BadMagic
+  3. version <= 1                              else UnsupportedVersion(version)   (version 0 is also rejected)
+  4. flags & 0xFFFE == 0                       else ReservedFlags(flags)
+  5. bytes.len() == 20 + stored_len            else Truncated (shorter) / LengthMismatch (longer)
+  6. if bit0: payload = zstd::decode (max output = uncompressed_len, refuse to exceed it)  else payload = body
+  7. payload.len() == uncompressed_len         else LengthMismatch
+  8. crc32(payload) == crc32 field             else CrcMismatch
+  Maximum accepted uncompressed_len = 512 MiB (guards against decompression bombs).
+end note
+
+@enduml
+
+@startuml 08b_payload_layouts
+!include _style.puml
+title File formats (b) - payload layouts (all integers LITTLE-ENDIAN, strings = u16 byte-length + UTF-8 bytes, no terminator)
+
+class "CanvasHeader  (8 + font_name bytes)" as CanvasHeader <<binary>> {
+  cols      : u16   1..=1024   (default 240)
+  rows      : u16   1..=1024   (default 72)
+  cell_w    : u8    1..=64     (default 8)
+  cell_h    : u8    1..=64     (default 15)
+  font_name : string  0..=256 bytes   (e.g. "default")
+}
+
+class "FrameBlock  (3 + 11 * cols * rows bytes)" as FrameBlock <<binary>> {
+  background : [u8;3]            RGB of the frame background colour
+  glyph_plane: [u32; cols*rows]  Unicode scalar value per cell, row-major (index = row*cols + col)
+  fg_plane   : [u8;3 * cols*rows]  R,G,B per cell
+  bg_plane   : [u8;4 * cols*rows]  R,G,B,A per cell; A = 0 -> bg None (transparent), A = 255 -> Some(RGB). Any other A is invalid.
+}
+
+class "AnimHeader  (8 bytes)  - .aanim only" as AnimHeader <<binary>> {
+  fps         : u8     1..=60
+  flags       : u8     bit0 = loop, bits 1..7 MUST be 0
+  reserved    : u16    MUST be 0
+  frame_count : u32    1..=10000
+}
+
+class "ProjectMeta  - .aspr only" as ProjectMeta <<binary>> {
+  name        : string   1..=1024 bytes
+  created_at  : i64      Unix seconds (UTC)
+  modified_at : i64      Unix seconds (UTC)
+  app_version : string   0..=64 bytes   (e.g. "0.1.0")
+}
+
+class "ProjectHeader  (12 bytes)  - .aspr only" as ProjectHeader <<binary>> {
+  fps            : u8    1..=60
+  flags          : u8    bit0 = loop, bits 1..7 MUST be 0
+  reserved       : u16   MUST be 0
+  selected_index : u32   < frame_count
+  frame_count    : u32   1..=10000
+}
+
+class ".ascii payload" as AsciiPayload <<binary>>
+class ".aanim payload" as AanimPayload <<binary>>
+class ".aspr payload"  as AsprPayload  <<binary>>
+
+AsciiPayload *-- "1 (1st)" CanvasHeader
+AsciiPayload *-- "1 (2nd)" FrameBlock
+
+AanimPayload *-- "1 (1st)" CanvasHeader
+AanimPayload *-- "1 (2nd)" AnimHeader
+AanimPayload *-- "frame_count (3rd..)" FrameBlock
+
+AsprPayload *-- "1 (1st)" CanvasHeader
+AsprPayload *-- "1 (2nd)" ProjectMeta
+AsprPayload *-- "1 (3rd)" ProjectHeader
+AsprPayload *-- "frame_count (4th..)" FrameBlock
+
+note bottom of FrameBlock
+  Size example for the default canvas (240 x 72 = 17 280 cells):
+  3 + 17280*4 (glyph) + 17280*3 (fg) + 17280*4 (bg) = 190 083 bytes per frame, before zstd.
+  Planes are stored separately (not interleaved per cell) because blank areas then compress to almost nothing.
+
+  Decoding a FrameBlock (FrameBlockCodec::read)
+  - needs exactly 3 + 11*cols*rows bytes, otherwise Truncated.
+  - glyph value that is not a valid Unicode scalar (surrogates, > 0x10FFFF) -> replaced by U+FFFD (lenient, no error).
+  - bg alpha not in {0, 255} -> InvalidField("bg_plane", "alpha must be 0 or 255").
+  FrameId values are NOT stored: after loading, frames receive ids 1..=N in order and project.next_frame_id = N + 1.
+  Frame.revision is not stored: it starts at 0 for every loaded frame.
+end note
+
+note bottom of ProjectHeader
+  Decoding rules (AsprCodec::decode)
+  - After the last FrameBlock there must be 0 remaining bytes, otherwise InvalidField("payload", "trailing bytes").
+  - cols/rows/cell_w/cell_h/fps/frame_count/selected_index outside the ranges above -> InvalidField(<name>, <range text>).
+  - reserved fields != 0 or reserved flag bits set -> InvalidField(<name>, "reserved bits set").
+  - Encoding (AsprCodec::encode): meta.name must be 1..=1024 bytes (the New Project modal already limits it to 64 chars).
+  AanimCodec::decode applies the same rules without ProjectMeta / selected_index (the loaded timeline selects frame 0).
+  AsciiCodec::decode: the single FrameBlock becomes frame id 1.
+end note
+
+@enduml
+
+@startuml 08c_test_vector
+!include _style.puml
+title File formats (c) - worked example (unit-test vector): a 2 x 1 cell .ascii file, 60 bytes, stored uncompressed
+
+legend top right
+  Image content: cell 0 = 'H' white on transparent, cell 1 = 'i' red on blue. Frame background #000000.
+  Canvas 2 x 1, cell 8 x 15, font_name "default".
+  The payload (40 bytes) zstd-compresses to 49 bytes (larger), so the writer stores it RAW: flags = 0, stored_len = 40.
+end legend
+
+map "ContainerHeader  (offset 0, 20 bytes)" as H {
+  magic => 41 53 43 49   ("ASCI")
+  version => 01 00
+  flags => 00 00
+  uncompressed_len => 28 00 00 00   (40)
+  stored_len => 28 00 00 00   (40)
+  crc32 => 81 23 19 DA   (0xDA192381)
+}
+
+map "CanvasHeader  (offset 20, 15 bytes)" as C {
+  cols => 02 00
+  rows => 01 00
+  cell_w => 08
+  cell_h => 0F
+  font_name => 07 00 + 64 65 66 61 75 6C 74   ("default")
+}
+
+map "FrameBlock  (offset 35, 25 bytes)" as F {
+  background => 00 00 00
+  glyph_plane => 48 00 00 00 | 69 00 00 00   ('H', 'i')
+  fg_plane => FF FF FF | FF 00 00
+  bg_plane => 00 00 00 00 | 00 00 FF FF   (None | Some(#0000FF))
+}
+
+H -[hidden]down-> C
+C -[hidden]down-> F
+
+note bottom of F
+  Full file (60 bytes):
+  41 53 43 49 01 00 00 00 28 00 00 00 28 00 00 00 81 23 19 DA
+  02 00 01 00 08 0F 07 00 64 65 66 61 75 6C 74
+  00 00 00  48 00 00 00 69 00 00 00  FF FF FF FF 00 00  00 00 00 00 00 00 FF FF
+  A test must assert: encode(image) == these 60 bytes, and decode(these 60 bytes) == image.
+end note
+
+@enduml

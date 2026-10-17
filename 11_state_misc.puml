@@ -1,0 +1,98 @@
+@startuml 11a_state_playback
+!include _style.puml
+title Playback state machine - PlaybackController
+
+state Stopped
+state Playing {
+  Playing : data / last_advance: Instant
+  Playing : entry / request_repaint_after(frame_duration)
+}
+
+[*] --> Stopped
+Stopped --> Playing : toggle_playback(now) [timeline.len() > 1 and no modal open]\n/ cancel/commit busy tool (ToolEvent::Cancel); last_advance = now
+Stopped --> Stopped : toggle_playback(now) [timeline.len() == 1]\n/ ignored (Play button is disabled)
+Playing --> Playing : tick(now) [elapsed = now - last_advance >= frame_duration]\n/ n = floor(elapsed / frame_duration);\n   last_advance += n * frame_duration;\n   target = selected + n; if looping target %= len; select(target)
+Playing --> Stopped : tick(now) [!looping and selected + n >= len - 1]\n/ select(len - 1)
+Playing --> Playing : tick(now) [elapsed < frame_duration]\n/ return Some(frame_duration - elapsed) for request_repaint_after
+Playing --> Stopped : Pause button | toggle_playback
+Playing --> Stopped : add / duplicate / delete / move frame, set background, undo, redo, fps change
+Playing --> Stopped : click on a frame in the list
+Playing --> Stopped : any modal opened | project closed
+
+note bottom
+  frame_duration = 1 / timeline.fps seconds (fps 1..=60).
+  During Playing the canvas shows the selected frame read-only: no ToolEvent is dispatched, selection ants and tool overlays are hidden.
+  Playing never writes to History and never marks the project dirty. Frame advance uses the frame's OWN background colour,
+  so a per-frame background change is visible during playback.
+  Starting playback begins at the currently selected frame (not at frame 1).
+end note
+@enduml
+
+@startuml 11b_state_dirty
+!include _style.puml
+title Project dirty tracking (History.clean_marker)
+
+state Clean
+state Dirty
+
+[*] --> Clean : project created or loaded\n/ clean_marker = Some(0)
+Clean --> Dirty : execute(cmd) | record_applied(cmd) | redo()\n[clean_marker != Some(undo_stack.len()) afterwards]
+Dirty --> Clean : mark_clean() after successful .aspr save\n[clean_marker = Some(undo_stack.len())]
+Dirty --> Clean : undo() | redo()\n[clean_marker == Some(undo_stack.len()) afterwards]
+Clean --> Dirty : undo()\n[undo_stack.len() != clean_marker afterwards]
+Dirty --> Dirty : record_applied(cmd) [clean_marker > undo_stack.len() before it]\n/ clean_marker = None (the clean state is unreachable)
+
+note bottom
+  Dirty is a computed property: is_dirty() = clean_marker != Some(undo_stack.len()).
+  Not dirty-making (never recorded): selection changes, zoom/pan, tool or colour changes, switching the selected frame, export, playback.
+  Dirty-making: every Command (cell patches, frame add/duplicate/delete/move, frame background, fps/loop).
+  The window title shows "name *" when dirty. Save As to a NEW path also calls mark_clean() once written.
+end note
+@enduml
+
+@startuml 11c_state_export_job
+!include _style.puml
+title MP4 export job state machine (worker thread, see Mp4Worker in 07)
+
+state Preparing {
+  Preparing : entry / spawn ffmpeg, start stderr drain thread
+}
+state Encoding {
+  Encoding : data / i: u32 (frames written), total: u32
+  Encoding : do / render frame i, write RGBA bytes to ffmpeg stdin, send Progress(i + 1, total)
+}
+state Finalizing {
+  Finalizing : entry / close stdin, child.wait()
+}
+state Cancelling {
+  Cancelling : entry / kill child, delete {out}.part
+}
+state Failed {
+  Failed : entry / kill child if alive, delete {out}.part, send Failed(error)
+}
+state Finished {
+  Finished : entry / rename {out}.part -> {out}, send Finished(path)
+}
+state Cancelled {
+  Cancelled : entry / send Cancelled
+}
+
+[*] --> Preparing : start_mp4()
+Preparing --> Encoding : ffmpeg spawned
+Preparing --> Failed : spawn error (FfmpegNotFound / Io)
+Encoding --> Encoding : [i < total and !cancel] frame written
+Encoding --> Cancelling : [cancel flag set] (checked before every frame)
+Encoding --> Failed : stdin write error (ffmpeg died)
+Encoding --> Finalizing : [i == total]
+Finalizing --> Finished : exit status == 0
+Finalizing --> Failed : exit status != 0 (FfmpegFailed with stderr tail)
+Cancelling --> Cancelled
+Finished --> [*]
+Failed --> [*]
+Cancelled --> [*]
+
+note as ExportNote
+  The UI thread never blocks on the job: AsciiPaintApp.poll_export_job() drains ExportMessage values once per egui frame.
+  The Cancel button only sets the shared AtomicBool; the worker reacts before rendering the next frame.
+end note
+@enduml

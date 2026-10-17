@@ -1,0 +1,136 @@
+@startuml 01_use_cases
+!include _style.puml
+left to right direction
+title Use cases - AsciiPaint
+
+actor "User" as U
+actor "File system" as FS <<system>>
+actor "ffmpeg" as FF <<external program>>
+
+rectangle "AsciiPaint" {
+
+  package "Project" {
+    usecase "Create new project" as UC_New
+    usecase "Open recent project" as UC_Recent
+    usecase "Close project" as UC_Close
+    usecase "Save project (.aspr)" as UC_SaveProj
+    usecase "Export current frame\n(.png / .ascii)" as UC_ExpFrame
+    usecase "Export animation\n(.aanim / .mp4)" as UC_ExpAnim
+    usecase "Choose project settings\n(name, folder, background, fps)" as UC_Settings
+    usecase "Choose file name and location" as UC_Where
+    usecase "Render frames to pixels" as UC_Render
+  }
+
+  package "Canvas editing" {
+    usecase "Edit cell (type characters)" as UC_Edit
+    usecase "Clear cell" as UC_Clear
+    usecase "Paint cell" as UC_Paint
+    usecase "Fill cell" as UC_Fill
+    usecase "Square select cells" as UC_Rect
+    usecase "Polygon select cells" as UC_Poly
+    usecase "Ellipse select cells" as UC_Ell
+    usecase "Constrain edits to selection" as UC_Constrain
+    usecase "Clear selection contents" as UC_ClearSel
+    usecase "Undo / redo" as UC_Undo
+  }
+
+  package "Colours" {
+    usecase "Choose paint colour" as UC_PaintCol
+    usecase "Choose erase colour" as UC_EraseCol
+    usecase "Edit frame background colour" as UC_Bg
+    usecase "Apply background to all frames" as UC_BgAll
+    usecase "Pick a colour" as UC_Pick
+  }
+
+  package "View" {
+    usecase "Zoom in / out" as UC_Zoom
+    usecase "Pan view" as UC_Pan
+    usecase "Toggle cell grid" as UC_Grid
+  }
+
+  package "Frames and animation" {
+    usecase "Add frame" as UC_Add
+    usecase "Duplicate frame" as UC_Dup
+    usecase "Delete frame" as UC_Del
+    usecase "Reorder frames" as UC_Move
+    usecase "Select frame" as UC_Sel
+    usecase "Set FPS / loop" as UC_Fps
+    usecase "Play / pause animation" as UC_Play
+  }
+}
+
+U --> UC_New
+U --> UC_Recent
+U --> UC_Close
+U --> UC_SaveProj
+U --> UC_ExpFrame
+U --> UC_ExpAnim
+U --> UC_Edit
+U --> UC_Clear
+U --> UC_Paint
+U --> UC_Fill
+U --> UC_Rect
+U --> UC_Poly
+U --> UC_Ell
+U --> UC_ClearSel
+U --> UC_Undo
+U --> UC_PaintCol
+U --> UC_EraseCol
+U --> UC_Bg
+U --> UC_Zoom
+U --> UC_Pan
+U --> UC_Grid
+U --> UC_Add
+U --> UC_Dup
+U --> UC_Del
+U --> UC_Move
+U --> UC_Sel
+U --> UC_Fps
+U --> UC_Play
+
+UC_New ..> UC_Settings : <<include>>
+UC_SaveProj ..> UC_Where : <<include>>
+UC_ExpFrame ..> UC_Where : <<include>>
+UC_ExpAnim ..> UC_Where : <<include>>
+UC_ExpFrame ..> UC_Render : <<include>>
+UC_ExpAnim ..> UC_Render : <<include>>
+UC_PaintCol ..> UC_Pick : <<include>>
+UC_EraseCol ..> UC_Pick : <<include>>
+UC_Bg ..> UC_Pick : <<include>>
+UC_Settings ..> UC_Pick : <<include>>
+UC_BgAll .> UC_Bg : <<extend>>
+UC_Constrain .> UC_Edit : <<extend>>
+UC_Constrain .> UC_Clear : <<extend>>
+UC_Constrain .> UC_Paint : <<extend>>
+UC_Constrain .> UC_Fill : <<extend>>
+UC_SaveProj .> UC_Close : <<extend>>
+
+UC_New --> FS
+UC_Recent --> FS
+UC_SaveProj --> FS
+UC_ExpFrame --> FS
+UC_ExpAnim --> FS
+UC_ExpAnim --> FF : .mp4 only
+
+note bottom of UC_Constrain
+  Extension point: "a selection exists".
+  When it does, every editing tool only affects cells inside the selection.
+  Without a selection the whole page is editable.
+end note
+
+note bottom of UC_Close
+  "Save project" extends "Close project" at the extension point "project has unsaved changes":
+  the user is asked Save / Discard / Cancel before the project is closed.
+end note
+
+note bottom of UC_Bg
+  Each frame owns its own background colour.
+  New frames copy the background of the selected frame; duplicated frames copy their source.
+  Cells with no background of their own (transparent) show this colour; exports use it too.
+end note
+
+note bottom of UC_Rect
+  The three selection use cases (square, polygon, ellipse) create the selection that activates the
+  "Constrain edits to selection" extension. Modifier keys while selecting: Shift = add, Alt = subtract.
+end note
+@enduml
