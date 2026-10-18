@@ -1,0 +1,17 @@
+[package]
+name = "ascii_io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ascii_core = { path = "../ascii_core" }
+ascii_render = { path = "../ascii_render" }
+thiserror.workspace = true
+zstd.workspace = true
+crc32fast.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+image.workspace = true
+dirs.workspace = true

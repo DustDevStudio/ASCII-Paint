@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    name: version getter
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read_version.outputs.version }}
+      tag: ${{ steps.read_version.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get version from file
+        id: read_version
+        run: |
+          VERSION=$(cat version | tr -d '[:space:]')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary_name: ascii_app
+            asset_name: ascii_paint-x86_64-unknown-linux-musl
+            rustflags: "-C target-feature=+crt-static"
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary_name: ascii_app
+            asset_name: ascii_paint-x86_64-apple-darwin
+            rustflags: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary_name: ascii_app
+            asset_name: ascii_paint-aarch64-apple-darwin
+            rustflags: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: ascii_app.exe
+            asset_name: ascii_paint-x86_64-pc-windows-msvc.exe
+            rustflags: "-C target-feature=+crt-static"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install musl tools
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build binary
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --target ${{ matrix.target }} --bin ascii_app
+
+      - name: Stage binary asset
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "dist/${{ matrix.asset_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate release notes from recent commits and authors
+        id: release_notes
+        run: |
+          echo "## Commits" > release_notes.md
+          echo "" >> release_notes.md
+          
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (%h) by %an" >> release_notes.md
+            echo "" >> release_notes.md
+            echo "### Authors" >> release_notes.md
+            git log "${PREV_TAG}..HEAD" --pretty=format:"- %an" | sort -u >> release_notes.md
+          else
+            git log -n 25 --pretty=format:"- %s (%h) by %an" >> release_notes.md
+            echo "" >> release_notes.md
+            echo "### Authors" >> release_notes.md
+            git log -n 25 --pretty=format:"- %an" | sort -u >> release_notes.md
+          fi
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file release_notes.md \
+            --latest \
+            artifacts/*/*
+
+      - name: Create and push release branch
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          git push origin "HEAD:refs/heads/$TAG"

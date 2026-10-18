@@ -1,0 +1,15 @@
+[package]
+name = "ascii_app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ascii_core = { path = "../ascii_core" }
+ascii_render = { path = "../ascii_render" }
+ascii_io = { path = "../ascii_io" }
+eframe.workspace = true
+egui.workspace = true
+rfd.workspace = true
+dirs.workspace = true
