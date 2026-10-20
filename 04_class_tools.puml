@@ -1,6 +1,6 @@
 @startuml 04_class_tools
 !include _style.puml
-title Tools, selection and shape algorithms - crate ascii_core::{tools, selection, algo}
+title Tools, brushes, selection and algorithms - crate ascii_core::{tools, brush, selection, algo}
 
 package "ascii_core::selection" {
   enum SelectionMode <<enum>> {
@@ -9,7 +9,7 @@ package "ascii_core::selection" {
     Subtract
   }
 
-  class Selection <<struct>> {
+  class Selection <<struct, Clone>> {
     - cols: u16
     - rows: u16
     - bits: Vec<u64>
@@ -21,9 +21,14 @@ package "ascii_core::selection" {
     + contains(c: CellCoord) -> bool
     + permits(c: CellCoord) -> bool
     + bounds() -> Option<CellRect>
+    + cells() -> Vec<CellCoord>
     + apply(cells: &[CellCoord], mode: SelectionMode)
     + select_all()
     + clear()
+    + invert()
+    + translate(dx: i32, dy: i32) -> bool
+    + restore(other: &Selection)
+    + resize(spec: &CanvasSpec)
     + boundary_edges() -> Vec<EdgeSegment>
     + revision() -> u64
   }
@@ -31,6 +36,55 @@ package "ascii_core::selection" {
   class EdgeSegment <<struct, Copy>> {
     + from: (u16, u16)
     + to: (u16, u16)
+  }
+}
+
+package "ascii_core::brush" {
+  class BrushId <<struct, Copy, Eq, Hash>> {
+    + 0: u32
+    + {static} FIRST_CUSTOM: u32 = 1000
+    + is_builtin() -> bool
+  }
+
+  class Stamp <<struct, Clone, Eq>> {
+    + width: u8
+    + height: u8
+    + anchor: (u8, u8)
+    + glyphs: Vec<Option<char>>
+    + {static} single(ch: char) -> Stamp
+    + glyph_at(x: u8, y: u8) -> Option<char>
+    + cells() -> impl Iterator<Item = (i8, i8, char)>
+    + fill_glyph() -> char
+  }
+
+  class Brush <<struct, Clone>> {
+    + id: BrushId
+    + name: String
+    + stamp: Stamp
+    + is_builtin() -> bool
+    + validate() -> Result<(), BrushError>
+  }
+
+  class BrushLibrary <<struct, Clone>> {
+    - brushes: Vec<Brush>
+    - next_custom: u32
+    + {static} with_builtins() -> BrushLibrary
+    + all() -> &[Brush]
+    + get(id: BrushId) -> Option< &Brush>
+    + default_id() -> BrushId
+    + upsert(b: Brush) -> Result<BrushId, BrushError>
+    + remove(id: BrushId) -> Result<(), BrushError>
+  }
+
+  enum BrushError <<enum>> {
+    InvalidName
+    DuplicateName
+    BadSize
+    EmptyStamp
+    AnchorNotOnGlyph
+    InvalidGlyph
+    BuiltinReadOnly
+    NotFound
   }
 }
 
@@ -43,39 +97,50 @@ package "ascii_core::algo" {
   }
 
   class FloodFill <<utility, no state>> {
-    + {static} region(grid: &Grid, seed: CellCoord, channel: PaintChannel, limit: &Selection) -> Vec<CellCoord>
+    + {static} region(layer: &Layer, seed: CellCoord, plane: Plane, limit: &Selection) -> Vec<CellCoord>
   }
 }
 
 package "ascii_core::tools" {
 
   enum ToolId <<enum>> {
-    EditCell
-    ClearCell
-    PaintCell
-    FillCell
+    Paint
+    Erase
+    Fill
+    Pick
     SelectRect
     SelectPolygon
     SelectEllipse
+    Move
   }
 
-  enum PaintChannel <<enum>> {
-    Foreground
-    Background
+  enum MoveMode <<enum>> {
+    Contents
+    OutlineOnly
   }
 
-  class Brush <<struct, Clone>> {
-    + paint: Rgb
-    + erase: Option<Rgb>
-    + channel: PaintChannel
-    + {static} default() -> Brush
+  enum PickSource <<enum>> {
+    Merged
+    ActiveLayer
+  }
+
+  class ToolOptions <<struct, Clone>> {
+    + brush: BrushId
+    + planes: PlaneSet
+    + ink_color: Rgba
+    + fill_color: Rgba
+    + erase_size: u8
+    + selection_mode: SelectionMode
+    + move_mode: MoveMode
+    + pick_source: PickSource
+    + {static} default() -> ToolOptions
+    + mode_for(mods: Modifiers) -> SelectionMode
   }
 
   class Modifiers <<struct, Copy>> {
     + shift: bool
     + alt: bool
     + ctrl: bool
-    + selection_mode() -> SelectionMode
   }
 
   enum ToolEvent <<enum>> {
@@ -86,7 +151,6 @@ package "ascii_core::tools" {
     PointerUp(cell: Option<CellCoord>, mods: Modifiers)
     DoubleClick(cell: CellCoord, mods: Modifiers)
     Key(key: ToolKey, mods: Modifiers)
-    Text(ch: char)
     Cancel
   }
 
@@ -104,29 +168,44 @@ package "ascii_core::tools" {
   enum ToolResponse <<enum>> {
     Consumed
     Ignored
+    Picked(PickedColors)
+  }
+
+  class PickedColors <<struct, Copy>> {
+    + ink: Option<Rgba>
+    + fill: Option<Rgba>
   }
 
   class ToolContext <<struct, borrowed>> {
     + project: &mut Project
     + selection: &mut Selection
-    + brush: &Brush
+    + options: &ToolOptions
+    + brushes: &BrushLibrary
     + history: &mut History
+  }
+
+  class ToolView <<struct, borrowed, read-only>> {
+    + options: &ToolOptions
+    + brushes: &BrushLibrary
+    + selection: &Selection
+    + spec: &CanvasSpec
   }
 
   interface Tool <<trait>> {
     + id() -> ToolId
     + display_name() -> &str
     + on_event(ev: ToolEvent, ctx: &mut ToolContext) -> ToolResponse
-    + overlay() -> ToolOverlay
+    + overlay(view: &ToolView) -> ToolOverlay
     + is_busy() -> bool
   }
 
   enum ToolOverlay <<enum>> {
     None
-    TextCursor(cell: CellCoord)
+    BrushFootprint(cells: Vec<CellCoord>)
     RectPreview(rect: CellRect, mode: SelectionMode)
     EllipsePreview(rect: CellRect, mode: SelectionMode)
     PolygonPreview(vertices: Vec<CellCoord>, hover: Option<CellCoord>, mode: SelectionMode)
+    MovePreview(floating: Option<Arc<CellBuffer>>, offset: (i32, i32))
   }
 
   class ToolRegistry <<struct>> {
@@ -141,25 +220,35 @@ package "ascii_core::tools" {
 
   class PatchBuilder <<struct>> {
     - frame_id: FrameId
-    - order: Vec<CellCoord>
-    - before: HashMap<CellCoord, Cell>
-    - after: HashMap<CellCoord, Cell>
-    + new(frame_id: FrameId) -> PatchBuilder
-    + write(project: &mut Project, c: CellCoord, new: Cell) -> bool
+    - layer_id: LayerId
+    - ink_order: Vec<CellCoord>
+    - ink_before: HashMap<CellCoord, InkCell>
+    - ink_after: HashMap<CellCoord, InkCell>
+    - fill_order: Vec<CellCoord>
+    - fill_before: HashMap<CellCoord, Rgba>
+    - fill_after: HashMap<CellCoord, Rgba>
+    + new(frame_id: FrameId, layer_id: LayerId) -> PatchBuilder
+    + write_ink(project: &mut Project, c: CellCoord, v: InkCell) -> bool
+    + write_fill(project: &mut Project, c: CellCoord, v: Rgba) -> bool
+    + clear(project: &mut Project, cells: &[CellCoord])
+    + blit(project: &mut Project, buf: &CellBuffer, offset: (i32, i32))
     + is_empty() -> bool
     + finish(label: &str) -> Option<CellPatchCommand>
+    + rollback(project: &mut Project)
   }
 
-  interface CellOperation <<trait>> {
+  interface StrokeOperation <<trait>> {
     + label() -> &str
-    + apply(old: Cell, brush: &Brush) -> Cell
+    + footprint(at: CellCoord, view: &ToolView) -> Vec<CellCoord>
+    + stamp(at: CellCoord, ctx: &mut ToolContext, b: &mut PatchBuilder)
   }
 
-  class ClearOperation <<struct>>
   class PaintOperation <<struct>>
+  class EraseOperation <<struct>>
 
-  class "StrokeTool<O: CellOperation>" as StrokeTool <<struct>> {
+  class "StrokeTool<O: StrokeOperation>" as StrokeTool <<struct>> {
     - op: O
+    - hover: Option<CellCoord>
     - stroke: Option<StrokeState>
   }
 
@@ -168,16 +257,10 @@ package "ascii_core::tools" {
     + builder: PatchBuilder
   }
 
-  class ClearCellTool <<type alias>>
-  class PaintCellTool <<type alias>>
+  class PaintTool <<type alias>>
+  class EraseTool <<type alias>>
 
-  class EditCellTool <<struct>> {
-    - cursor: Option<CellCoord>
-    - anchor_col: u16
-    - session: Option<PatchBuilder>
-  }
-
-  class FillCellTool <<struct>>
+  class FillTool <<struct>>
 
   interface DragShape <<trait>> {
     + label() -> &str
@@ -206,23 +289,43 @@ package "ascii_core::tools" {
     - hover: Option<CellCoord>
     - mode: SelectionMode
   }
+
+  class PickTool <<struct>> {
+    - hover: Option<CellCoord>
+    - dragging: bool
+  }
+
+  class MoveTool <<struct>> {
+    - drag: Option<MoveDrag>
+  }
+
+  class MoveDrag <<struct>> {
+    + anchor: CellCoord
+    + offset: (i32, i32)
+    + selection_before: Selection
+    + floating: Option<Arc<CellBuffer>>
+    + builder: Option<PatchBuilder>
+  }
 }
 
 ' ---- relationships ----
-Tool <|.. EditCellTool
-Tool <|.. FillCellTool
 Tool <|.. StrokeTool
+Tool <|.. FillTool
+Tool <|.. PickTool
 Tool <|.. ShapeSelectTool
 Tool <|.. SelectPolygonTool
+Tool <|.. MoveTool
 
-CellOperation <|.. ClearOperation
-CellOperation <|.. PaintOperation
-StrokeTool o-- "1" CellOperation : op
+StrokeOperation <|.. PaintOperation
+StrokeOperation <|.. EraseOperation
+StrokeTool o-- "1" StrokeOperation : op
 StrokeTool *-- "0..1" StrokeState
 StrokeState *-- "1" PatchBuilder
-EditCellTool *-- "0..1" PatchBuilder : typing session
-ClearCellTool ..> StrokeTool : <<bind>> O -> ClearOperation
-PaintCellTool ..> StrokeTool : <<bind>> O -> PaintOperation
+PaintTool ..> StrokeTool : <<bind>> O -> PaintOperation
+EraseTool ..> StrokeTool : <<bind>> O -> EraseOperation
+MoveTool *-- "0..1" MoveDrag
+MoveDrag *-- "0..1" PatchBuilder
+MoveDrag *-- "1" Selection : selection_before
 
 DragShape <|.. RectShape
 DragShape <|.. EllipseShape
@@ -231,46 +334,71 @@ ShapeSelectTool *-- "0..1" DragState
 SelectRectTool ..> ShapeSelectTool : <<bind>> S -> RectShape
 SelectEllipseTool ..> ShapeSelectTool : <<bind>> S -> EllipseShape
 
-ToolRegistry *-- "7" Tool : tools
+ToolRegistry *-- "8" Tool : tools
 ToolRegistry --> ToolId : active
 Tool ..> ToolEvent : consumes
 Tool ..> ToolOverlay : produces
 Tool ..> ToolContext : uses
+Tool ..> ToolView : reads
 Tool ..> ToolResponse
+ToolResponse ..> PickedColors
 ToolEvent ..> ToolKey
 ToolEvent ..> Modifiers
-ToolContext o-- Brush
+ToolContext o-- ToolOptions
+ToolContext o-- BrushLibrary
 ToolContext o-- Selection
-Brush *-- PaintChannel
+ToolView o-- ToolOptions
+ToolView o-- BrushLibrary
+ToolView o-- Selection
+ToolOptions --> BrushId : brush
+ToolOptions ..> MoveMode
+ToolOptions ..> PickSource
+ToolOptions ..> SelectionMode
+ToolOptions ..> Modifiers : mode_for()
+
+BrushLibrary *-- "13..*" Brush
+Brush *-- "1" BrushId
+Brush *-- "1" Stamp
+Brush ..> BrushError
+BrushLibrary ..> BrushError
+PaintOperation ..> BrushLibrary : reads the active brush
+PaintOperation ..> Stamp
 
 ShapeSelectTool ..> ShapeRasterizer
 SelectPolygonTool ..> ShapeRasterizer
 StrokeTool ..> ShapeRasterizer : line()
 RectShape ..> ShapeRasterizer
 EllipseShape ..> ShapeRasterizer
-FillCellTool ..> FloodFill
+FillTool ..> FloodFill
+FillTool ..> Stamp : fill_glyph()
 FloodFill ..> Selection : limit
 Selection ..> SelectionMode
 Selection ..> EdgeSegment : boundary_edges()
-Modifiers ..> SelectionMode : shift=Add, alt=Subtract, else Replace
 
 note as N1
   is_busy() per tool (true = something is in progress that Cancel would commit or discard)
-  EditCellTool: session has uncommitted changes | StrokeTool: stroke is Some | ShapeSelectTool: drag is Some
-  SelectPolygonTool: vertices is not empty | FillCellTool: always false
-  overlay() is a pure read (called every egui frame while painting); it never mutates the tool.
+  StrokeTool: stroke is Some | ShapeSelectTool: drag is Some | SelectPolygonTool: vertices is not empty
+  MoveTool: drag is Some | FillTool: always false | PickTool: always false
+  overlay(view) is a pure read (called every egui frame while painting); it never mutates the tool.
+  Paint / Erase return BrushFootprint(op.footprint(hover, view)) while the pointer is over the page, so the user sees which cells a click would touch.
 end note
 
 note as N2
   Selection semantics
-  - Not part of the project file and NOT in undo history. Persists across frame switches.
-  - permits(c) = is_empty() || contains(c).  EVERY drawing tool must call permits() before writing a cell,
-    so with an active selection the edits are clipped to it; with no selection the whole page is editable.
-  - apply(cells, Replace)  : clear(), then insert all.   apply(cells, Add): insert all.
-    apply(cells, Subtract) : remove all.
+  - Not part of the project file. NOT recorded by the history, except together with the two operations that move it (Move cells,
+    Paste / Import as layer): those store a SelectionChange{ before, after } next to their command (see diagram 05).
+    It persists across frame and layer switches (a page-level mask shared by all layers).
+  - permits(c) = is_empty() || contains(c). Paint, Erase, Fill and "Clear selection" call permits() before writing a cell, so with an
+    active selection the edits are clipped to it; with no selection the whole page is editable.
+  - apply(cells, Replace): clear(), then insert all.  apply(cells, Add): insert all.  apply(cells, Subtract): remove all.
+  - invert(): complement inside the page. Does nothing on an empty selection (the menu item is disabled). When the complement is empty
+    (select all, then invert) the selection is empty again = whole page editable.
+  - translate(dx, dy) -> bool: shifts the mask, returns false and changes nothing when a selected cell would leave the page
+    (the Move tool clamps its offset first, so this never happens in practice).
+  - restore(other): replace the mask and its size (undo / redo of a SelectionChange).  resize(spec): grow the mask, new cells unselected.
   - Every mutation bumps revision; the canvas caches boundary_edges() per revision.
-  - Keyboard (handled by EditorScreen, not by a tool): Ctrl+A = select_all(), Ctrl+D / Esc (no tool busy) = clear(),
-    Delete (no EditCell session) = clear every selected cell of the current frame via ClearOperation as ONE command.
+  - Keyboard (handled by EditorScreen, not by a tool): Ctrl+A = select_all(), Ctrl+D / Esc (no tool busy) = clear(), Ctrl+Shift+I = invert(),
+    Delete = clear the contents of every selected cell of the ACTIVE layer (both planes) as ONE command (see 14c).
 end note
 
 note as N3
@@ -278,78 +406,97 @@ note as N3
   - Pointer position is converted to a cell with floor(). If it is outside the page:
       * PointerDown outside the page is dropped (tool never sees it).
       * PointerMove / PointerUp outside the page send cell = None; tools then use the LAST valid cell
-        (stroke tools skip the segment, shape tools clamp via CanvasSpec::clamp).
+        (stroke tools skip the segment, shape tools clamp via CanvasSpec::clamp, the Move tool keeps its offset).
+  - PointerMove is sent for EVERY pointer move over the canvas (button up or down), so tools can show hover previews.
   - Only the primary (left) button reaches tools. Middle button / Space+drag = pan (see ViewportController).
   - While playback is Playing the CanvasView sends NO tool events.
   - Switching tool = ToolRegistry.switch_to(): old.on_event(Deactivate) then new.on_event(Activate).
-  - Deactivate / Cancel semantics: StrokeTool commits what was painted so far; EditCellTool commits its typing session;
+  - Deactivate / Cancel semantics: StrokeTool commits what was painted so far; MoveTool rolls the drag back (nothing is moved);
     ShapeSelectTool and SelectPolygonTool discard the preview (selection unchanged).
+  - Write guard (Paint, Erase, Fill, Move-contents): they only ever write into the ACTIVE layer of the selected frame, and only when
+    that layer is visible. On a hidden layer the event is Consumed, nothing changes, the status bar says "Layer is hidden".
+  - PickTool never writes: it returns ToolResponse::Picked(colours) and the caller (CanvasView -> EditorSession::apply_picked) updates the ToolOptions colours.
+    It therefore works on hidden layers and ignores the selection.
+  - There is no text input any more: egui Event::Text is not translated into tool events (characters are typed only in the Brush editor).
 end note
 
 note as N4
-  write(project, c, new)
-  1. frame = project.timeline.selected_frame_mut()
-  2. old = frame.grid.get(c); if old == new -> return false (no-op, nothing recorded)
-  3. first time c is touched: before[c] = old (never overwritten later)
-  4. frame.set_cell(c, new); after[c] = new; push c to `order` once
-  5. return true
+  PatchBuilder - records the edits of ONE layer of ONE frame
+  write_ink(project, c, v) / write_fill(project, c, v):
+  1. v = v.normalized(). old = current value of that plane at c (c outside the page -> return false).
+  2. old == v -> return false (no-op, nothing recorded).
+  3. first time c is touched in this plane: before[c] = old (never overwritten later).
+  4. frame.set_ink / set_fill; after[c] = v; push c to the plane's `order` once.
+  5. return true.
+  clear(project, cells) = write_ink(EMPTY) + write_fill(TRANSPARENT) for every cell.
+  blit(project, buf, offset) = the blit rule of CellBuffer (only non-empty source cells overwrite), cells translated by offset, off-page cells skipped.
   The cell is changed IMMEDIATELY (live feedback); history only receives the command at finish().
-  finish(label): drop cells where before[c] == after[c]; if none left -> None;
-  else Some(CellPatchCommand { frame_id, changes in `order`, label }).
-  The tool then calls history.record_applied(cmd) - it does NOT apply again.
+  finish(label): drop cells where before == after (per plane); nothing left -> None; else Some(CellPatchCommand{ frame_id, layer_id, ink_changes,
+  fill_changes, label }). The tool then calls history.record_applied(cmd) - it does NOT apply again.
+  rollback(project): write every `before` value back (reverse order of `order`) and forget the changes (a cancelled Move drag).
 end note
 
 note as N5
-  Stroke rules (Clear cell / Paint cell)
-  - PointerDown(c): start StrokeState{ last = c, builder }, then paint cell c only if selection.permits(c).
-    (Permission is checked per cell, so a stroke may cross in and out of the selection.)
-  - PointerMove(Some(c)) while a stroke is active: for every cell k in ShapeRasterizer::line(last, c)
-    (excluding `last`, including c) call write(k, op.apply(old, brush)) if selection.permits(k).
-    Then last = c. This guarantees no gaps on fast mouse moves.
-  - PointerMove(None): keep stroke alive, do not change `last`.
-  - PointerUp / Deactivate / Cancel: finish(op.label()) -> history.record_applied(cmd); stroke = None.
-    One drag = ONE undo step.
+  Stroke rules (Paint / Erase)
+  - PointerMove(Some(c)) while idle: hover = Some(c) (drives the BrushFootprint overlay).
+  - PointerDown(c): start StrokeState{ last = c, builder = PatchBuilder::new(frame id, active layer id) }, then op.stamp(c).
+  - PointerMove(Some(c)) while a stroke is active: for every cell k in ShapeRasterizer::line(last, c) (excluding `last`, including c)
+    call op.stamp(k). Then last = c. The brush stamp is repeated on every cell of the line, so fast mouse moves leave no gaps.
+  - PointerMove(None): keep the stroke alive, do not change `last`.
+  - PointerUp / Deactivate / Cancel: finish(op.label()) -> history.record_applied(cmd); stroke = None. One drag = ONE undo step.
+  - The selection is checked per target cell inside stamp(), so a stroke may cross in and out of the selection.
 end note
 
 note as N6
-  apply(old, brush) = Cell { glyph: ' ', fg: Rgb::WHITE, bg: brush.erase }
-  brush.erase == None  -> cell becomes fully transparent (frame background shows through).
-  label() = "Clear cells"
+  EraseOperation
+  footprint(at) = square of erase_size x erase_size cells, anchor = (erase_size - 1) / 2 on both axes, clipped to the page.
+  stamp(at): for every cell k of the footprint with selection.permits(k):
+    planes.foreground -> write_ink(k, InkCell::EMPTY)       planes.background -> write_fill(k, Rgba::TRANSPARENT)
+  label() = "Erase cells". With no plane switched on the tool does nothing.
 end note
 
 note as N7
-  apply(old, brush):
-    channel == Foreground -> Cell { fg: brush.paint, ..old }          (glyph and bg untouched)
-    channel == Background -> Cell { bg: Some(brush.paint), ..old }    (glyph and fg untouched)
-  label() = "Paint cells"
+  PaintOperation
+  brush = brushes.get(options.brush). footprint(at) = every glyph cell of the stamp, placed so that stamp.anchor lands on `at`, clipped to the page.
+  stamp(at): for every footprint cell k (stamp glyph ch) with selection.permits(k):
+    planes.foreground -> write_ink(k, InkCell{ glyph: ch, color: options.ink_color })
+    planes.background -> write_fill(k, options.fill_color)
+  A stamp cell that is empty (None) leaves the page cell untouched in BOTH planes.
+  Painting REPLACES the cell value - colours are mixed between layers, never inside a plane.
+  label() = "Paint cells". With no plane switched on the tool does nothing.
 end note
 
 note as N8
-  Edit cell rules (text cursor)
-  - PointerDown(c): if !selection.permits(c) ignore. Else commit current session, cursor = Some(c), anchor_col = c.col.
-  - Text(ch) (printable, not control): requires cursor. write(cursor, Cell { glyph: ch, fg: brush.paint, bg: old.bg }).
-      Then cursor.col = min(cursor.col + 1, cols - 1). The cursor never wraps to the next row.
-      If the new cursor cell is not permitted by the selection the cursor stays where it was.
-  - Key(Enter)    : cursor = (min(anchor_col, cols-1), min(row + 1, rows - 1)).
-  - Key(Backspace): if cursor.col > 0 { cursor.col -= 1 }; write(cursor, Cell { glyph: ' ', ..old }).
-  - Key(Delete)   : write(cursor, Cell { glyph: ' ', ..old }); cursor does not move.
-  - Key(Arrow*)   : commit session, then move cursor by one cell clamped to the page; anchor_col = new col for Left/Right.
-  - Key(Escape) / Cancel / Deactivate / PointerDown elsewhere: commit session (finish("Edit text")), cursor = None.
-  - One typing session (click ... until a commit trigger above) = ONE undo step.
+  Brushes
+  - A brush is a stamp: up to 8 x 8 cells, each cell = one glyph or empty (None = "do not touch this cell"), plus an anchor cell that
+    lands on the pointer. A single-character brush is a 1 x 1 stamp.
+  - Built-in brushes (ids 1..999, read-only): 1 x 1 stamps of  .  :  -  =  +  *  #  %  @  and the blocks U+2588 U+2593 U+2592 U+2591.
+    Built-ins whose glyph is missing from the font are hidden in the picker (ascii_app asks GlyphSource::contains).
+  - Custom brushes are created / edited / deleted in the Brush editor, the ONLY place where characters are typed (diagram 13b).
+    Ids start at 1000. Stored per user in <config_dir>/AsciiPaint/brushes.json (BrushStore, diagram 07), NOT inside .aspr files.
+  - validate(): name 1..=32 chars and unique (case-insensitive), width and height 1..=8, at least one glyph,
+    anchor inside the stamp AND on a glyph cell, every glyph a printable Unicode scalar (' ' is allowed).
+  - fill_glyph() = the glyph under the anchor. This is the "char" the Fill tool uses.
+  - Deleting the active brush makes options.brush = BrushLibrary::default_id() (the '#' brush).
 end note
 
 note as N9
-  Fill cell rules
-  - PointerDown(c): if selection is non-empty and !selection.contains(c) -> ignore.
-  - target colour = brush.paint (Foreground channel sets fg, Background channel sets bg = Some(paint)).
-  - cells = FloodFill::region(grid, c, brush.channel, &selection)   (see activity diagram 19)
-  - if cells is empty -> nothing. Else write all of them through ONE PatchBuilder, label "Fill cells".
-  - If the seed cell already has the paint colour in that channel the region is empty (no-op).
+  Fill rules (works on the ACTIVE layer only, never reads another layer)
+  - PointerDown(c): the active layer must be visible. If the selection is non-empty and !selection.contains(c) -> ignored.
+  - EVERY plane switched on in options.planes is filled independently - the boundary of a fill is decided by that plane alone:
+      Foreground: region = FloodFill::region(layer, c, Foreground, &selection) = the connected cells whose InkCell equals the seed's InkCell
+                  (glyph AND colour). Every cell gets InkCell{ glyph: brush.fill_glyph(), color: options.ink_color }.
+      Background: region = FloodFill::region(layer, c, Background, &selection) = the connected cells whose fill colour equals the seed's.
+                  Every cell gets options.fill_color.
+    Both planes on = two separate regions written through ONE PatchBuilder (one undo step), label "Fill cells".
+  - If the seed already holds the target value in a plane, that plane's region is empty (nothing to do). Nothing written -> nothing recorded.
+  - Example: fill an empty area with '#' in red (foreground), then fill the same area's background blue. The two fills never decide
+    each other's boundary.
 end note
 
 note as N10
   Rect / Ellipse select rules
-  - PointerDown(c): drag = DragState{ anchor: c, current: c, mode: mods.selection_mode() }.
+  - PointerDown(c): drag = DragState{ anchor: c, current: c, mode: options.mode_for(mods) } (Shift = Add, Alt = Subtract, else the top bar mode).
   - PointerMove(Some(c)): drag.current = c.  PointerMove(None): drag.current = clamp(last pointer position).
   - overlay(): RectPreview / EllipsePreview of CellRect::from_corners(anchor, current) (nothing is selected yet).
   - PointerUp: cells = shape.rasterize(anchor, current); selection.apply(cells, drag.mode); drag = None.
@@ -359,17 +506,64 @@ end note
 
 note as N11
   Polygon select rules
-  - PointerDown(c): if vertices is empty, mode = mods.selection_mode(). If c equals the LAST vertex ignore it
+  - PointerDown(c): if vertices is empty, mode = options.mode_for(mods). If c equals the LAST vertex ignore it
       (this also absorbs the 2nd click of a double-click). If c equals vertices[0]: close() when vertices.len() >= 3,
       otherwise ignore it. Otherwise push c.
   - PointerMove(Some(c)): hover = Some(c) (rubber-band edge preview).
   - DoubleClick / Key(Enter): close().
-  - Key(Backspace): pop last vertex; if empty the tool is idle again.
+  - Key(Backspace): pop last vertex. If empty the tool is idle again.
   - Key(Escape) / Cancel / Deactivate: vertices.clear() (selection unchanged).
   - close(): if vertices.len() < 3 -> discard and clear. Else
       cells = ShapeRasterizer::polygon(vertices); selection.apply(cells, mode); vertices.clear().
 end note
 
+note as N12
+  Move rules (needs a non-empty selection, options.move_mode = Contents or OutlineOnly)
+  - PointerDown(c): ignored unless selection.contains(c). Otherwise drag = MoveDrag{ anchor: c, offset: (0, 0), selection_before: selection.clone() }.
+      Contents    : the active layer must be visible. floating = Arc::new(CellBuffer::extract(layer, selection)); builder = PatchBuilder::new(..);
+                    builder.clear(project, selected cells) - the layer shows a hole right away.
+      OutlineOnly : no buffer, no builder.
+  - PointerMove(Some(c)): offset = (c - anchor) clamped so that selection.bounds() shifted by offset stays inside the page. PointerMove(None): offset unchanged.
+    overlay() = MovePreview{ floating, offset }: the renderer draws the floating cells and the shifted selection outline.
+  - PointerUp:
+      offset == (0, 0) : Contents -> builder.rollback() (nothing recorded). OutlineOnly -> nothing.
+      Contents         : builder.blit(project, floating, offset); selection.translate(offset); cmd = builder.finish("Move cells");
+                         history.record_applied_with_selection(cmd, SelectionChange{ before: selection_before, after: selection.clone() }).
+      OutlineOnly      : selection.translate(offset) only (selection changes are not undoable).
+  - Key(Arrow*) with no drag and a non-empty selection: one nudge by 1 cell (Shift = 10 cells), executed exactly like PointerUp with that offset
+    (clamped to the page). Each key press is one undo step.
+  - Cancel / Escape / Deactivate during a drag: Contents -> builder.rollback(). drag = None. Selection unchanged.
+  - Moved cells overwrite the destination only where the moved cell has content (blit rule of CellBuffer). The cells the move left behind are empty.
+end note
+
+note as N13
+  ToolOptions = everything the top bar edits. One value per editor session, not saved in the project.
+  - brush + planes: Paint (stamp and planes), Fill (fill glyph and planes), Erase (planes). ink_color + fill_color: Paint and Fill.
+  - erase_size 1..=16: Erase only.
+  - selection_mode: the Replace / Add / Subtract buttons of the three select tools.
+    mode_for(mods) = Shift -> Add, Alt -> Subtract, otherwise options.selection_mode. A held modifier always wins over the button.
+  - move_mode: Contents (default) or OutlineOnly.
+  - pick_source: Merged (default) or ActiveLayer. planes also tells the Pick tool WHICH colour to pick (Foreground -> ink_color, Background -> fill_color).
+  - default(): brush '#', planes = { Foreground }, ink_color = opaque white, fill_color = opaque #808080, erase_size = 1, Replace, Contents, Merged.
+end note
+
+note as N14
+  Pick rules (colour picker / eyedropper). Never writes into the project: not undoable, not dirty-making.
+  - PointerMove(Some(c)): hover = Some(c). overlay() = BrushFootprint([c]), a one-cell outline of the cell that would be sampled.
+  - PointerDown(c), and PointerMove(Some(c)) while the button is held (drag to scrub): sample cell c and return
+    ToolResponse::Picked(PickedColors{ ink, fill }) according to the paint mode in options.planes:
+      planes.foreground -> ink  = the character colour at c
+      planes.background -> fill = the background colour at c
+    options.pick_source decides where the colours come from:
+      Merged      : cell = Compositor::flatten_cell(selected frame, c). ink = cell.ink when cell.glyph != ' ', fill = cell.fill when cell.fill.a > 0.
+                    This is the colour mix the user SEES (layer opacity and alpha mixing included; the frame background is not part of fill).
+      ActiveLayer : the active layer's own cell. ink = ink.color when its glyph != ' ', fill = fill colour when its alpha > 0. Also works on a hidden layer.
+  - A plane with nothing at c (no character, or a fully transparent background) yields None for that plane: that colour stays as it was and the status bar
+    says "No character here" / "No background here". No plane switched on = nothing is picked.
+  - Only colours are picked. The brush / glyph is never changed. The picked colour keeps its alpha.
+  - EditorSession::apply_picked(p): ink -> set_ink_color, fill -> set_fill_color. The active selection is ignored (picking works anywhere on the page).
+  - PointerUp / Cancel / Deactivate: nothing to commit.
+end note
 
 ' ---- rule notes: attached to their class, stacked in one column (hidden links) ----
 Tool .. N1
@@ -377,12 +571,15 @@ Selection .. N2
 ToolContext .. N3
 PatchBuilder .. N4
 StrokeTool .. N5
-ClearOperation .. N6
+EraseOperation .. N6
 PaintOperation .. N7
-EditCellTool .. N8
-FillCellTool .. N9
+BrushLibrary .. N8
+FillTool .. N9
 ShapeSelectTool .. N10
 SelectPolygonTool .. N11
+MoveTool .. N12
+ToolOptions .. N13
+PickTool .. N14
 N1 -[hidden]down-> N2
 N2 -[hidden]down-> N3
 N3 -[hidden]down-> N4
@@ -393,4 +590,7 @@ N7 -[hidden]down-> N8
 N8 -[hidden]down-> N9
 N9 -[hidden]down-> N10
 N10 -[hidden]down-> N11
+N11 -[hidden]down-> N12
+N12 -[hidden]down-> N13
+N13 -[hidden]down-> N14
 @enduml

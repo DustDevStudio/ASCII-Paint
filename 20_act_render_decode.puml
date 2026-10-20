@@ -1,25 +1,27 @@
 @startuml 20a_act_render_frame
 !include _style.puml
-title Activity - FrameRasterizer::render(frame, canvas, glyphs)  (PNG export, MP4 export)
+title Activity - FrameRasterizer::render(flat, canvas, glyphs)  (PNG export, MP4 export; flat = Compositor::flatten(frame))
 
 start
 :W := canvas.cols * cell_w, H := canvas.rows * cell_h;
-:buf := RgbaBuffer(W, H) with EVERY pixel = (frame.background.r, .g, .b, 255);
+:buf := RgbaBuffer(W, H) with EVERY pixel = (flat.background.r, .g, .b, 255);
 note right
-  This is where the frame background colour is applied: transparent cells (bg = None) simply keep it.
+  This is where the frame background colour is applied: cells whose mixed fill is transparent (fill.a == 0) simply keep it.
+  The layers were already merged by the Compositor (hidden layers left out), so this function knows nothing about layers.
 end note
 
 repeat :for each cell (col, row) in row-major order;
-  :cell := frame.grid.get((col, row));
+  :cell := flat.grid.get((col, row));
   :x0 := col * cell_w, y0 := row * cell_h;
-  if (cell.bg is Some(c)) then (yes)
-    :fill the rectangle [x0, x0 + cell_w) x [y0, y0 + cell_h) with (c.r, c.g, c.b, 255);
+  if (cell.fill.a > 0) then (yes)
+    :base := cell.fill.over(opaque flat.background) = flat.page_color((col, row));
+    :fill the rectangle [x0, x0 + cell_w) x [y0, y0 + cell_h) with (base.r, base.g, base.b, 255);
   endif
   if (cell.glyph != ' ') then (yes)
     :mask := glyphs.mask(cell.glyph)   (cell_w x cell_h alpha bytes);
-    :for each pixel (mx, my) with a := mask[my * cell_w + mx] > 0:
-      p := buf[x0 + mx, y0 + my],
-      p.rgb := (p.rgb * (255 - a) + cell.fg * a + 127) / 255   (per channel, integer maths);
+    :for each pixel (mx, my) with m := mask[my * cell_w + mx] > 0:
+      a := (m * cell.ink.a + 127) / 255,
+      when a > 0: p := buf[x0 + mx, y0 + my], p.rgb := (p.rgb * (255 - a) + cell.ink.rgb * a + 127) / 255   (per channel, integer maths);
   endif
 repeat while (more cells?) is (yes)
 
@@ -27,7 +29,8 @@ repeat while (more cells?) is (yes)
 stop
 
 note right
-  Cells whose glyph is ' ' and bg is None are skipped entirely (fast path: the buffer already holds the background).
+  Cells whose glyph is ' ' and whose fill.a is 0 are skipped entirely (fast path: the buffer already holds the background).
+  A translucent ink (ink.a < 255) lets the cell background shine through the glyph pixels.
   Output is always opaque, which is what PNG (RGBA8) and ffmpeg (rgba -> yuv420p) expect.
   Cost for 1920 x 1080: ~17 k cell visits, ~2 M pixel writes worst case; typically < 15 ms.
 end note
@@ -35,7 +38,7 @@ end note
 
 @startuml 20b_act_decode_file
 !include _style.puml
-title Activity - Decoding a file (AsprCodec::decode; AsciiCodec / AanimCodec follow the same steps)
+title Activity - Decoding a file (AsprCodec::decode; AsciiCodec / AanimCodec follow the same steps with flat frame blocks)
 
 start
 :bytes := file contents;
@@ -83,16 +86,110 @@ endif
 
 :r := ByteReader(payload);
 :canvas := CanvasHeader (cols, rows, cell_w, cell_h, font_name) - range checked, else InvalidField(name, range);
-:.aspr only: meta := ProjectMeta, header := ProjectHeader (fps, loop flag, selected_index, frame_count) - range checked;
+:.aspr: meta := ProjectMeta, header := ProjectHeader (fps, loop flag, selected_index, frame_count) - range checked;
+:.aanim: header := AnimHeader (fps, loop flag, frame_count) - range checked.  .ascii: frame_count := 1;
 :frames := [];
-repeat :FrameBlockCodec::read(r, canvas, id = frames.len() + 1);
+repeat
+  :.aspr: LayeredFrameBlockCodec::read(r, canvas, id = frames.len() + 1) = FrameHeader + layer_count LayerBlocks (layers get ids 1..layer_count)
+  .ascii / .aanim: FlatFrameBlockCodec::read(r, canvas) = background + glyph, ink and fill planes;
   :push frame;
 repeat while (frames.len() < frame_count?) is (yes)
 if (r.remaining() == 0?) then (no)
   :return Err(InvalidField("payload", "trailing bytes"));
   stop
 endif
-:build Project { meta, canvas, timeline{ frames, selected = selected_index, fps, looping }, next_frame_id = frame_count + 1 };
-:return Ok(project);
+if (kind == Aspr?) then (yes)
+  :build Project { meta, canvas, timeline{ frames, selected = selected_index, fps, looping }, next_frame_id = frame_count + 1 };
+elseif (kind == Aanim?) then (yes)
+  :build AsciiAnimation{ canvas, font_name, fps, looping, frames };
+else (Ascii)
+  :build AsciiImage{ canvas, font_name, frame = frames[0] };
+endif
+:return Ok(value);
 stop
+@enduml
+
+@startuml 20c_act_compose_cell
+!include _style.puml
+title Activity - Compositor::flatten_cell(frame, c)  (flatten() runs it for every cell of the page)
+
+start
+:glyph := ' ', ink := TRANSPARENT, fill := TRANSPARENT;
+repeat :for each layer L from the BOTTOM layer to the TOP layer;
+  if (L.visible?) then (yes)
+    :k := L.opacity;
+    :f := L.fill[c].scaled_alpha(k);
+    :fill := f.over(fill)   (a fully transparent f changes nothing);
+    :cell := L.ink[c];
+    :a := cell.color.scaled_alpha(k);
+    if (cell.glyph != ' ' and a.a > 0?) then (yes)
+      :glyph := cell.glyph   (a higher layer overwrites the glyph of a lower layer);
+      :ink := a.over(ink)   (the colour mixes with the colours of all glyphs below);
+    endif
+  endif
+repeat while (more layers?) is (yes)
+:return FlatCell{ glyph, ink, fill };
+stop
+
+note right
+  What the rules mean
+  - Character: only the TOPMOST layer with a character in that cell is shown.
+      layer 1 = [" ", "1", "1"], layer 2 = [" ", " ", "2"]  ->  result [" ", "1", "2"]
+  - Character colour: the mix of the colours of EVERY layer that has a character in that cell, bottom to top.
+      layer 1 has 'A' in opaque blue (0,0,255,255), layer 2 has 'B' in red at alpha 128 (255,0,0,128):
+      glyph = 'B', ink = (255,0,0,128).over((0,0,255,255)) = (128,0,127,255).
+  - A layer without a character in that cell does not tint anything, whatever colour it stores there.
+  - Ink with alpha 0 (after layer opacity) is invisible: it neither shows nor hides the character below.
+  - Background: the fills of ALL visible layers are mixed bottom to top. Where the result is transparent the frame background shows.
+  - Layer opacity multiplies the alpha of both planes. Hidden layers are skipped completely.
+  - Mixing happens only between layers: painting inside one layer replaces the cell value.
+end note
+@enduml
+
+@startuml 20d_act_parse_text
+!include _style.puml
+title Activity - TextImporter::parse(bytes)  (plain .txt file -> ParsedText)
+
+start
+:bytes := file contents (size already limited to 16 MiB by ImportService);
+:strip a UTF-8 byte order mark (EF BB BF) when present;
+:text := UTF-8 decode, every invalid sequence replaced by U+FFFD (replaced_invalid counts them);
+:lines := split text on CRLF, LF or a lone CR;
+:drop trailing empty lines (a final newline does not create a row);
+if (no line left?) then (yes)
+  :return Err(Empty);
+  stop
+endif
+:rows := [];
+repeat :for each line;
+  :row := [], col := 0;
+  repeat :for each character ch of the line;
+    if (ch is TAB?) then (yes)
+      :n := TAB_WIDTH - (col mod TAB_WIDTH), push n spaces, col += n, expanded_tabs += 1;
+    elseif (ch is a control character U+0000..U+001F or U+007F?) then (yes)
+      :push ' ', col += 1;
+    else (no)
+      :push ch, col += 1;
+    endif
+  repeat while (more characters?) is (yes)
+  :rows.push(row);
+repeat while (more lines?) is (yes)
+:width := length of the longest row, height := rows.len();
+if (width == 0?) then (yes)
+  :return Err(Empty);
+  stop
+endif
+if (width > MAX_DIM or height > MAX_DIM?) then (yes)
+  :return Err(TooLarge("4096 x 4096 cells"));
+  stop
+endif
+:return ParsedText{ lines: rows, width, height, replaced_invalid, expanded_tabs };
+stop
+
+note right
+  Every Unicode scalar value is exactly ONE cell (the page uses a monospace grid): wide characters and combining marks get no special treatment.
+  Rows shorter than `width` are implicitly padded with empty cells when the text is turned into a CellBuffer (ImportedFile::to_buffer).
+  Spaces become EMPTY ink (no character), so the lower layers show through them.
+  Warnings for the import dialog: "N invalid UTF-8 sequences were replaced", "N tabs were expanded to spaces".
+end note
 @enduml

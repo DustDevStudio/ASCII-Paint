@@ -1,6 +1,6 @@
 @startuml 07_class_io_render
 !include _style.puml
-title Rendering, file formats, persistence and export - crates ascii_render and ascii_io
+title Rendering, file formats, persistence, import and export - crates ascii_render and ascii_io
 
 package "ascii_render" {
 
@@ -36,11 +36,11 @@ package "ascii_render" {
   }
 
   class FrameRasterizer <<utility>> {
-    + {static} render(frame: &Frame, canvas: &CanvasSpec, glyphs: &dyn GlyphSource) -> RgbaBuffer
+    + {static} render(flat: &FlatFrame, canvas: &CanvasSpec, glyphs: &dyn GlyphSource) -> RgbaBuffer
   }
 
   class ThumbnailBuilder <<utility>> {
-    + {static} build(frame: &Frame) -> RgbaBuffer
+    + {static} build(flat: &FlatFrame) -> RgbaBuffer
   }
 }
 
@@ -68,7 +68,12 @@ package "ascii_io::format" {
     + {static} unwrap(kind: FileKind, bytes: &[u8]) -> Result<Vec<u8>, FormatError>
   }
 
-  class FrameBlockCodec <<utility>> {
+  class FlatFrameBlockCodec <<utility>> {
+    + {static} write(out: &mut Vec<u8>, flat: &FlatFrame)
+    + {static} read(r: &mut ByteReader, canvas: &CanvasSpec) -> Result<FlatFrame, FormatError>
+  }
+
+  class LayeredFrameBlockCodec <<utility>> {
     + {static} write(out: &mut Vec<u8>, frame: &Frame)
     + {static} read(r: &mut ByteReader, canvas: &CanvasSpec, id: FrameId) -> Result<Frame, FormatError>
   }
@@ -94,7 +99,7 @@ package "ascii_io::format" {
   class AsciiImage <<struct>> {
     + canvas: CanvasSpec
     + font_name: String
-    + frame: Frame
+    + frame: FlatFrame
   }
 
   class AsciiAnimation <<struct>> {
@@ -102,7 +107,7 @@ package "ascii_io::format" {
     + font_name: String
     + fps: Fps
     + looping: bool
-    + frames: Vec<Frame>
+    + frames: Vec<FlatFrame>
   }
 
   class AsciiCodec <<struct>>
@@ -116,6 +121,7 @@ package "ascii_io::format" {
     ReservedFlags(flags: u16)
     CrcMismatch
     LengthMismatch
+    TooLarge
     InvalidField(name: &str, reason: String)
     Compression(String)
   }
@@ -156,6 +162,81 @@ package "ascii_io::storage" {
     Format(FormatError)
     NotFound
   }
+
+  class BrushStore <<struct>> {
+    - file: PathBuf
+    - library: BrushLibrary
+    + open_default() -> BrushStore
+    + library() -> &BrushLibrary
+    + upsert(b: Brush) -> Result<BrushId, BrushStoreError>
+    + remove(id: BrushId) -> Result<(), BrushStoreError>
+    - persist() -> io::Result<()>
+  }
+
+  class BrushRecord <<struct, Serialize, Deserialize>> {
+    + id: u32
+    + name: String
+    + width: u8
+    + height: u8
+    + anchor: (u8, u8)
+    + cells: Vec<Option<String>>
+  }
+
+  enum BrushStoreError <<enum>> {
+    Brush(BrushError)
+    Io(io::Error)
+  }
+}
+
+package "ascii_io::import" {
+
+  class ImportService <<struct>> {
+    + {static} MAX_FILE_BYTES: u64 = 16 MiB
+    + load(path: &Path) -> Result<ImportedFile, ImportError>
+  }
+
+  class ImportedFile <<struct>> {
+    + kind: ImportKind
+    + name: String
+    + width: u32
+    + height: u32
+    + warnings: Vec<String>
+    - source: ImportSource
+    + to_buffer(ink: Rgba) -> CellBuffer
+  }
+
+  enum ImportKind <<enum>> {
+    PlainText
+    AsciiImage
+  }
+
+  enum ImportSource <<enum>> {
+    Text(ParsedText)
+    Image(AsciiImage)
+  }
+
+  class TextImporter <<utility>> {
+    + {static} MAX_DIM: u32 = 4096
+    + {static} TAB_WIDTH: u32 = 4
+    + {static} parse(bytes: &[u8]) -> Result<ParsedText, ImportError>
+  }
+
+  class ParsedText <<struct>> {
+    + lines: Vec<Vec<char>>
+    + width: u32
+    + height: u32
+    + replaced_invalid: usize
+    + expanded_tabs: usize
+  }
+
+  enum ImportError <<enum>> {
+    Io(io::Error)
+    NotFound
+    UnsupportedType(ext: String)
+    Empty
+    TooLarge(max: String)
+    Format(FormatError)
+  }
 }
 
 package "ascii_io::export" {
@@ -164,6 +245,7 @@ package "ascii_io::export" {
     + export_frame_png(project: &Project, path: &Path, glyphs: &dyn GlyphSource) -> Result<(), ExportError>
     + export_frame_ascii(project: &Project, path: &Path, glyphs: &dyn GlyphSource) -> Result<(), ExportError>
     + export_animation_aanim(project: &Project, path: &Path, glyphs: &dyn GlyphSource) -> Result<(), ExportError>
+    + start_ascii_sequence(project: &Project, folder: PathBuf, base: String, glyphs: Arc<dyn GlyphSource>) -> ExportJobHandle
     + start_mp4(project: &Project, path: PathBuf, glyphs: Arc<dyn GlyphSource>, ffmpeg: PathBuf) -> ExportJobHandle
   }
 
@@ -182,13 +264,28 @@ package "ascii_io::export" {
     Cancelled
   }
 
+  interface ExportWorker <<trait, Send>> {
+    + run(tx: Sender<ExportMessage>, cancel: Arc<AtomicBool>)
+  }
+
   class Mp4Worker <<struct>> {
     - frames: Vec<Frame>
     - canvas: CanvasSpec
     - fps: Fps
     - out: PathBuf
     - ffmpeg: PathBuf
-    + run(tx: Sender<ExportMessage>, cancel: Arc<AtomicBool>)
+  }
+
+  class AsciiSequenceWorker <<struct>> {
+    - frames: Vec<Frame>
+    - canvas: CanvasSpec
+    - font_name: String
+    - folder: PathBuf
+    - names: Vec<String>
+  }
+
+  class SequenceNamer <<utility>> {
+    + {static} names(base: &str, count: usize) -> Vec<String>
   }
 
   class FfmpegLocator <<utility>> {
@@ -217,8 +314,8 @@ GlyphSource ..> GlyphMask
 FrameRasterizer ..> GlyphSource
 FrameRasterizer ..> RgbaBuffer : returns
 ThumbnailBuilder ..> RgbaBuffer : returns
-FrameRasterizer ..> Frame
-ThumbnailBuilder ..> Frame
+FrameRasterizer ..> FlatFrame
+ThumbnailBuilder ..> FlatFrame
 
 FormatCodec <|.. AsciiCodec : T = AsciiImage
 FormatCodec <|.. AanimCodec : T = AsciiAnimation
@@ -226,33 +323,56 @@ FormatCodec <|.. AsprCodec : T = Project
 AsciiCodec ..> ContainerCodec
 AanimCodec ..> ContainerCodec
 AsprCodec ..> ContainerCodec
-AsciiCodec ..> FrameBlockCodec
-AanimCodec ..> FrameBlockCodec
-AsprCodec ..> FrameBlockCodec
+AsciiCodec ..> FlatFrameBlockCodec
+AanimCodec ..> FlatFrameBlockCodec
+AsprCodec ..> LayeredFrameBlockCodec
 ContainerCodec *-- ContainerHeader
 ContainerCodec ..> FileKind
-FrameBlockCodec ..> ByteReader
+FlatFrameBlockCodec ..> ByteReader
+LayeredFrameBlockCodec ..> ByteReader
 AsciiCodec ..> AsciiImage
 AanimCodec ..> AsciiAnimation
 ContainerCodec ..> FormatError
-FrameBlockCodec ..> FormatError
+FlatFrameBlockCodec ..> FormatError
+LayeredFrameBlockCodec ..> FormatError
 
 ProjectRepository ..> AsprCodec
 ProjectRepository ..> AtomicWriter
 ProjectRepository ..> RepoError
 RecentStore *-- "0..10" RecentEntry
 RecentStore ..> AtomicWriter
+BrushStore *-- "1" BrushLibrary
+BrushStore ..> BrushRecord : json
+BrushStore ..> AtomicWriter
+BrushStore ..> BrushStoreError
+
+ImportService ..> ImportedFile : returns
+ImportService ..> TextImporter
+ImportService ..> AsciiCodec
+ImportService ..> ImportError
+ImportedFile *-- "1" ImportKind
+ImportedFile *-- "1" ImportSource
+ImportSource *-- ParsedText
+ImportSource *-- AsciiImage
+TextImporter ..> ParsedText : returns
+ImportedFile ..> CellBuffer : to_buffer()
 
 ExportService ..> FrameRasterizer
 ExportService ..> AsciiCodec
 ExportService ..> AanimCodec
 ExportService ..> AtomicWriter
 ExportService ..> ExportJobHandle : creates
+ExportService ..> SequenceNamer
 ExportJobHandle *-- ExportMessage : channel
-ExportJobHandle ..> Mp4Worker : spawns thread
+ExportWorker <|.. Mp4Worker
+ExportWorker <|.. AsciiSequenceWorker
+ExportJobHandle ..> ExportWorker : spawns thread
 Mp4Worker ..> FrameRasterizer
 Mp4Worker ..> Ffmpeg : stdin pipe (raw RGBA)
 Mp4Worker ..> ExportMessage : sends
+AsciiSequenceWorker ..> AsciiCodec
+AsciiSequenceWorker ..> AtomicWriter
+AsciiSequenceWorker ..> ExportMessage : sends
 FfmpegLocator ..> Ffmpeg : looks up
 ExportMessage ..> ExportError
 
@@ -268,18 +388,23 @@ note as N1
 end note
 
 note as N2
-  render() - exact compositing (see activity diagram 20)
+  render() - exact compositing (see activity diagram 20a). The input is the FLATTENED frame (Compositor::flatten): hidden layers are already left out,
+  glyph / ink colour / fill colour are already mixed across the layers.
   - Output size = canvas.pixel_width x canvas.pixel_height (1920 x 1080 for the default canvas), RGBA8, alpha always 255.
-  - pixel = frame.background; if cell.bg = Some(c) pixel = c; then pixel = lerp(pixel, cell.fg, mask_alpha / 255).
-  ThumbnailBuilder::build(frame): ONE pixel per cell (cols x rows image):
-    base = cell.bg or frame.background;  if glyph != ' ' pixel = lerp(base, cell.fg, 0.6) else pixel = base.
+  - pixel = flat.background; if cell.fill.a > 0 pixel = cell.fill.over(pixel) (opaque result);
+    then for each glyph pixel: a = div255(mask_alpha * cell.ink.a); pixel = lerp(pixel, cell.ink.rgb, a / 255).
+  ThumbnailBuilder::build(flat): ONE pixel per cell (cols x rows image):
+    base = flat.page_color(c);  if glyph != ' ' pixel = lerp(base, cell.ink.rgb, 0.6 * cell.ink.a / 255) else pixel = base.
+  Callers flatten first: the canvas renderer and the thumbnail cache cache the FlatFrame per Frame.revision, exports flatten once per frame.
 end note
 
 note as N3
   wrap(kind, payload): header.magic = kind.magic(), version = 1, uncompressed_len = payload.len(), crc32 = crc32fast(payload),
   payload is compressed with zstd level 3 and flags bit0 = 1 (stored_len = compressed length).
   If compression does not make it smaller, store raw with flags bit0 = 0 (stored_len = uncompressed_len).
-  unwrap(kind, bytes): see decode activity diagram (20). Binary layouts: diagram 08.
+  A payload larger than 512 MiB is refused with FormatError::TooLarge (the same limit unwrap() enforces), so a file that was written can always be read back.
+  unwrap(kind, bytes): see decode activity diagram (20b). Binary layouts: diagram 08.
+  Which codec writes what: .aspr = layered frames (every layer, both planes, layer name / visibility / opacity); .ascii and .aanim = FLATTENED frames.
 end note
 
 note as N4
@@ -303,21 +428,23 @@ note as N6
 end note
 
 note as N7
-  PNG       : buf = FrameRasterizer::render(selected frame); image crate encodes RGBA8 PNG; AtomicWriter.
-  .ascii    : AsciiCodec.encode(AsciiImage{ canvas, font_name, frame = selected frame clone }); AtomicWriter.
-  .aanim    : AanimCodec.encode(AsciiAnimation{ canvas, font_name, fps, looping, frames = all frames }); AtomicWriter.
+  PNG       : flat = Compositor::flatten(selected frame); buf = FrameRasterizer::render(&flat); image crate encodes RGBA8 PNG; AtomicWriter.
+  .ascii    : AsciiCodec.encode(AsciiImage{ canvas, font_name, frame = flat of the selected frame }); AtomicWriter. ONE flattened image, no layers.
+  .aanim    : AanimCodec.encode(AsciiAnimation{ canvas, font_name, fps, looping, frames = every frame flattened }); AtomicWriter.
+  ASCII sequence : start_ascii_sequence() clones the frames into an AsciiSequenceWorker and spawns ONE std::thread; returns immediately.
   MP4       : start_mp4() clones the frames into Mp4Worker and spawns ONE std::thread; returns immediately.
-  PNG / .ascii / .aanim run synchronously on the UI thread (small, fast). Only MP4 is asynchronous.
+  PNG / .ascii / .aanim run synchronously on the UI thread (small, fast). The sequence and the MP4 are asynchronous (at most ONE job at a time).
+  Hidden layers are never exported. Only .aspr keeps the layers.
 end note
 
 note as N8
-  run():
+  Mp4Worker.run():
   1. spawn  ffmpeg -y -hide_banner -loglevel error -f rawvideo -pix_fmt rgba -s {W}x{H} -framerate {fps} -i pipe:0
             -vf pad=ceil(iw/2)*2:ceil(ih/2)*2 -c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p -movflags +faststart
             -f mp4 {out}.part      (stdin piped, stderr piped; no shell is used, each token is one argument)
   2. a helper thread drains stderr into a ring buffer of the last 4 KiB (prevents a full pipe from blocking ffmpeg).
   3. for i in 0..frames.len(): if cancel is set -> kill child, delete {out}.part, send Cancelled, return.
-       buf = FrameRasterizer::render(frames[i]); stdin.write_all(&buf.pixels); send Progress(i + 1, total).
+       flat = Compositor::flatten(frames[i]); buf = FrameRasterizer::render(&flat); stdin.write_all(&buf.pixels); send Progress(i + 1, total).
   4. drop(stdin); status = child.wait(). status != 0 -> delete .part, send Failed(FfmpegFailed(code, stderr_tail)).
   5. fs::rename({out}.part, {out}); send Finished(out).
   Any io error on the pipe -> kill child, delete .part, send Failed(Io).
@@ -328,6 +455,41 @@ note as N9
   Evaluated once at startup and again each time the Save modal opens (so installing ffmpeg does not need a restart).
 end note
 
+note as N10
+  AsciiSequenceWorker.run()  (one .ascii file per frame, same flattened format as the single-frame export)
+  names = SequenceNamer::names(base, count) = "<base>_frame<NNN>.ascii", NNN = 1-based index zero-padded to max(3, digits(count)).
+  1. for i in 0..frames.len(): if cancel is set -> delete every {folder}/{name}.part written so far, send Cancelled, return.
+       flat = Compositor::flatten(frames[i]); bytes = AsciiCodec.encode(AsciiImage{ canvas, font_name, frame: flat });
+       write bytes to {folder}/{names[i]}.part (flush + sync_all); send Progress(i + 1, total).
+  2. after the LAST frame: rename every .part to its final name (fast; an existing file with that name is replaced).
+  3. send Finished(folder). Any io / format error in step 1 -> delete all .part files written so far, send Failed(..).
+  Because the final names appear only in step 2, a cancelled export or an encode / write error never leaves a half-written sequence and never destroys older files.
+  A failure INSIDE step 2 (e.g. a locked file) deletes the remaining .part files and reports the file name; names already renamed stay.
+end note
+
+note as N11
+  BrushStore - the user's brush library, stored as JSON { "version": 1, "brushes": [ BrushRecord ] } in <config_dir>/AsciiPaint/brushes.json.
+  - Only CUSTOM brushes are stored (BrushRecord.cells: row-major, null = empty stamp cell, otherwise a one-character string).
+    Built-in brushes come from BrushLibrary::with_builtins() and are never written.
+  - open_default(): missing file -> built-ins only. Corrupt file or a record that fails Brush::validate -> the file is renamed brushes.json.bad
+    and the library starts with the built-ins (never a crash). Valid records are kept when only some records are bad.
+  - upsert(b): BrushLibrary::upsert (validates, assigns the id), then persist() with AtomicWriter. remove(id): BrushLibrary::remove, then persist().
+    If persist() fails the in-memory change stays for this run and the caller shows an ErrorModal.
+end note
+
+note as N12
+  ImportService::load(path)
+  - The extension (case-insensitive) decides: "txt" -> TextImporter::parse, "ascii" -> AsciiCodec.decode. Anything else -> UnsupportedType.
+  - A file larger than MAX_FILE_BYTES -> TooLarge. Missing file -> NotFound. Other read errors -> Io.
+  - PlainText: ParsedText (rules in activity diagram 20d). width = longest line, height = number of lines. No characters at all -> Empty.
+    Text up to 4096 x 4096 is accepted: the project can only grow to 1024 x 1024, anything larger is cut off (the import modal says how much).
+  - AsciiImage: width = canvas.cols, height = canvas.rows of the file. The file's frame background colour and font name are ignored.
+  - ImportedFile.name = file name without extension, cut to 64 chars (used as the new layer name).
+  - to_buffer(ink): origin (0, 0), mask all true.
+      PlainText : every character except ' ' -> InkCell{ glyph, color: ink }, spaces -> InkCell::EMPTY, fill = TRANSPARENT.
+      AsciiImage: InkCell{ glyph, color: the file's ink colour } (blank glyph -> EMPTY), fill = the file's fill colour; `ink` is ignored.
+  - warnings (shown in the import modal): replaced invalid UTF-8 sequences, expanded tabs.
+end note
 
 ' ---- rule notes: attached to their class, stacked in one column (hidden links) ----
 TtfGlyphSource .. N1
@@ -339,6 +501,9 @@ RecentStore .. N6
 ExportService .. N7
 Mp4Worker .. N8
 FfmpegLocator .. N9
+AsciiSequenceWorker .. N10
+BrushStore .. N11
+ImportService .. N12
 N1 -[hidden]down-> N2
 N2 -[hidden]down-> N3
 N3 -[hidden]down-> N4
@@ -347,4 +512,7 @@ N5 -[hidden]down-> N6
 N6 -[hidden]down-> N7
 N7 -[hidden]down-> N8
 N8 -[hidden]down-> N9
+N9 -[hidden]down-> N10
+N10 -[hidden]down-> N11
+N11 -[hidden]down-> N12
 @enduml

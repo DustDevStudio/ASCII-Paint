@@ -40,7 +40,7 @@ else User clicks Create [form valid]
   App -> Clk : now_unix()
   Clk --> App : now
   App -> P : Project::new(name, background, fps, now)
-  P --> App : project   (1 blank frame, selected = 0, history will start clean)
+  P --> App : project   (1 blank frame holding 1 blank layer, selected = 0, history will start clean)
   App -> App : path = folder / (name + ".aspr")
   App -> Repo : save(path, &project)
   Repo -> Disk : AsprCodec.encode(project) then AtomicWriter::write(path, bytes)
@@ -52,10 +52,10 @@ else User clicks Create [form valid]
     Disk --> Repo : Ok
     Repo --> App : Ok
     App -> Recent : touch(path, name, now)
-    App -> Ed : EditorScreen::new(project, path, glyphs)
+    App -> Ed : EditorScreen::new(project, path, glyphs, Services.brushes.library().clone(), Services.clipboard.clone())
     note right of Ed
-      EditorSession defaults: tool = EditCell, paint = #FFFFFF, erase = None (transparent),
-      channel = Background, show_grid = true, history = new (clean), selection = empty,
+      EditorSession defaults: tool = Paint, brush = '#', planes = {Foreground}, ink = opaque white, fill = opaque #808080,
+      erase size = 1, active layer = "Layer 1" of frame 1, show_grid = true, history = new (clean), selection = empty,
       playback = Stopped, viewport.needs_fit = true -> CanvasView calls viewport.fit() on its first paint,
       when the real widget size is known.
     end note
@@ -121,7 +121,7 @@ else
   alt Ok(project)
     Repo --> App : project
     App -> Recent : touch(path, project.meta.name, now)
-    App -> Ed : EditorScreen::new(project, path, glyphs)
+    App -> Ed : EditorScreen::new(project, path, glyphs, brush library, clipboard)
     App -> App : screen = Editor(Ed); modal = None
   else Err(RepoError::NotFound)
     Repo --> App : NotFound

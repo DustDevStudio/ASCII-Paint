@@ -1,16 +1,16 @@
 @startuml 13a_seq_paint_stroke
 !include _style.puml
-title Sequence - Paint cell / Clear cell stroke (mouse drag on the canvas)
+title Sequence - Paint / Erase stroke (mouse drag on the canvas, active layer)
 autonumber
 
 actor User
 participant "CanvasView" as CV
 participant "Viewport" as VP
 participant "ToolRegistry" as TR
-participant "StrokeTool<O>" as ST
+participant "StrokeTool<O>\n(Paint or Erase)" as ST
 participant "Selection" as Sel
 participant "PatchBuilder" as PB
-participant "Frame\n(selected)" as F
+participant "Frame / active Layer\n(selected frame)" as F
 participant "History" as H
 participant "FramePanel /\nThumbnailCache" as TC
 
@@ -19,15 +19,32 @@ CV -> VP : screen_to_cell(p, canvas)
 VP --> CV : Some(c)   (None = outside the page: event is dropped)
 CV -> TR : dispatch(PointerDown(c, mods), ctx)
 TR -> ST : on_event(PointerDown(c, mods))
-ST -> PB : new(frame_id of selected frame)
-ST -> Sel : permits(c)
-Sel --> ST : bool
-opt permits(c)
-  ST -> PB : write(project, c, op.apply(old, brush))
-  PB -> F : get(c) then set_cell(c, new)   (only if new != old)
-  F -> F : revision += 1
+ST -> F : active layer visible?
+alt layer is hidden
+  ST --> TR : Consumed   (nothing is written, status bar: Layer is hidden)
+else visible
+  ST -> PB : new(frame_id, active layer id)
+  ST -> ST : op.stamp(c)
+  note right of ST
+    Paint: footprint = the glyph cells of the active brush's stamp, anchor on c.
+    Erase: footprint = erase_size x erase_size square.
+  end note
+  loop for each footprint cell k
+    ST -> Sel : permits(k)
+    Sel --> ST : bool
+    opt permitted
+      opt planes.foreground
+        ST -> PB : write_ink(project, k, Paint: InkCell{ glyph, ink_color }  /  Erase: InkCell::EMPTY)
+      end
+      opt planes.background
+        ST -> PB : write_fill(project, k, Paint: fill_color  /  Erase: Rgba::TRANSPARENT)
+      end
+      PB -> F : set_ink(layer, k, v) / set_fill(layer, k, v)   (only if the normalised value differs)
+      F -> F : revision += 1
+    end
+  end
+  ST --> TR : Consumed
 end
-ST --> TR : Consumed
 
 loop pointer moves while the button is held
   User -> CV : move to p'
@@ -38,133 +55,190 @@ loop pointer moves while the button is held
   alt cell = Some(c')
     ST -> ST : cells = ShapeRasterizer::line(last, c')  (Bresenham, excludes last)
     loop for each k in cells
-      ST -> Sel : permits(k)
-      opt permitted
-        ST -> PB : write(project, k, op.apply(old, brush))
-        PB -> F : set_cell(k, new)  /  first-touch "before" kept in PatchBuilder
-      end
+      ST -> ST : op.stamp(k)   (the same per-cell steps as above, selection checked per target cell)
     end
     ST -> ST : last = c'
   else cell = None
     ST -> ST : ignored
   end
-  note right of CV : egui repaints; CanvasRenderer reads the live grid,\nso the user sees the stroke immediately.
+  note right of CV : egui repaints; CanvasRenderer re-flattens the frame (new revision),\nso the user sees the stroke immediately.
 end
 
 User -> CV : primary button up
 CV -> TR : dispatch(PointerUp(cell), ctx)
 TR -> ST : on_event(PointerUp)
 ST -> PB : finish(op.label())
-alt at least one cell really changed
-  PB --> ST : Some(CellPatchCommand)
+alt at least one value really changed
+  PB --> ST : Some(CellPatchCommand{ frame_id, layer_id, ink_changes, fill_changes })
   ST -> H : record_applied(cmd)
-  H -> H : redo_stack.clear(); undo_stack.push(cmd); enforce limit 200
+  H -> H : redo_stack.clear(); undo_stack.push(entry); enforce limit 200
   note right of H : history.is_dirty() is now true\n(window title shows "*")
-else nothing changed
+else nothing changed (or no plane switched on)
   PB --> ST : None   (nothing recorded)
 end
 ST -> ST : stroke = None
 ... next egui frame ...
 TC -> F : revision() differs from cached thumbnail
-TC -> TC : ThumbnailBuilder::build(frame) and upload texture  (skipped while a tool is busy)
+TC -> TC : Compositor::flatten(frame), ThumbnailBuilder::build(flat) and upload texture  (skipped while a tool is busy)
 @enduml
 
-@startuml 13b_seq_edit_text
+@startuml 13b_seq_create_brush
 !include _style.puml
-title Sequence - Edit cell (typing characters)
+title Sequence - Create a custom brush (the only place where characters are typed)
 autonumber
 
 actor User
-participant "CanvasView" as CV
-participant "ToolRegistry" as TR
-participant "EditCellTool" as ET
-participant "Selection" as Sel
-participant "PatchBuilder" as PB
-participant "Frame\n(selected)" as F
-participant "History" as H
+participant "ToolOptionsBar" as TB
+participant "AsciiPaintApp" as App
+participant "BrushEditorModal" as M
+participant "GlyphSource" as GS
+participant "BrushStore" as BS
+participant "BrushLibrary" as BL
+participant "AtomicWriter" as Disk
+participant "EditorSession" as S
+participant "ErrorModal" as Err
 
-User -> CV : click on cell c
-CV -> TR : dispatch(PointerDown(c, mods))
-TR -> ET : on_event(PointerDown(c))
-ET -> Sel : permits(c)
-alt permitted
-  ET -> ET : commit() previous session (if any)
-  ET -> ET : cursor = Some(c); anchor_col = c.col
-else not permitted
-  ET -> ET : ignored
+User -> TB : click [New...] in the Paint (or Fill) options
+TB --> App : AppAction::OpenBrushEditor(None)
+App -> M : new(editing = None, name = "New brush", 1 x 1, empty cells, anchor (0, 0))
+App -> App : modal = Some(Modal::BrushEditor(M)); playback.pause()
+
+loop while the modal is open
+  User -> M : edit name / width / height / type one character per cell / pick the anchor cell
+  M -> GS : contains(ch) for every typed character
+  GS --> M : bool   (missing_glyphs is updated, a warning is shown, the brush stays valid)
+  M -> M : to_brush() -> Brush::validate() enables or disables [Save]\nand shows the first problem (name taken, no glyph, anchor not on a glyph, ...)
 end
-note right of CV : the canvas takes keyboard focus on click
 
-User -> CV : types "A"  (egui Event::Text("A"))
-CV -> TR : dispatch(Text('A'))
-TR -> ET : on_event(Text('A'))
-alt cursor = None
-  ET --> TR : Ignored
-else cursor = Some(k)
-  ET -> Sel : permits(k)
-  opt permitted
-    ET -> PB : (create session lazily) new(frame_id)
-    ET -> PB : write(project, k, Cell{ glyph: 'A', fg: brush.paint, bg: old.bg })
-    PB -> F : set_cell(k, new); revision += 1
-    ET -> ET : next = (min(k.col + 1, cols - 1), k.row); if permits(next) cursor = next
+alt User clicks Cancel or presses Esc
+  M --> App : ModalOutcome::Cancelled
+  App -> App : modal = None   (nothing changes)
+else User clicks Save [brush valid]
+  User -> M : click Save
+  M --> App : Accepted(AppAction::SaveBrush(brush))   (id = None for a new brush, Some(id) when editing a custom brush)
+  App -> BS : upsert(brush)
+  BS -> BL : upsert(brush)   (validates again, assigns the next custom id >= 1000)
+  BL --> BS : Ok(BrushId)
+  BS -> Disk : persist(): brushes.json = every CUSTOM brush, AtomicWriter::write
+  alt write ok
+    Disk --> BS : Ok
+    BS --> App : Ok(BrushId)
+  else write fails
+    Disk --> BS : Err(io)
+    BS --> App : Err(BrushStoreError::Io)
+    App -> Err : new("Brush could not be saved", message)   (the brush stays usable until the app closes)
   end
-  ET --> TR : Consumed
+  App -> S : set_brush_library(BS.library().clone()); set_brush(id)
+  App -> App : modal = None  (or Error modal)
 end
 
-User -> CV : presses Enter
-CV -> TR : dispatch(Key(Enter))
-TR -> ET : on_event(Key(Enter))
-ET -> ET : cursor = (min(anchor_col, cols - 1), min(row + 1, rows - 1))
-
-User -> CV : presses Escape
-CV -> TR : dispatch(Key(Escape))
-TR -> ET : on_event(Key(Escape))
-ET -> PB : finish("Edit text")
-PB --> ET : Option<CellPatchCommand>
-opt Some(cmd)
-  ET -> H : record_applied(cmd)
-end
-ET -> ET : cursor = None
+note over S
+  The brush is NOT part of the project: no command, project not dirty, not stored in .aspr.
+  Editing a built-in brush opens the editor on a copy ("<name> copy") and saves it as a new custom brush.
+  Delete (top bar): AppAction::DeleteBrush(id) -> BrushStore.remove(id) -> persist -> session.set_brush_library(..)
+  (if it was the active brush the session falls back to the '#' brush).
+end note
 @enduml
 
 @startuml 13c_seq_fill
 !include _style.puml
-title Sequence - Fill cell
+title Sequence - Fill (foreground and / or background plane of the active layer)
 autonumber
 
 actor User
 participant "CanvasView" as CV
 participant "ToolRegistry" as TR
-participant "FillCellTool" as FT
+participant "FillTool" as FT
 participant "Selection" as Sel
 participant "FloodFill" as FF
 participant "PatchBuilder" as PB
-participant "Frame\n(selected)" as F
+participant "Frame / active Layer\n(selected frame)" as F
 participant "History" as H
 
 User -> CV : click on cell c
 CV -> TR : dispatch(PointerDown(c, mods))
 TR -> FT : on_event(PointerDown(c))
-FT -> Sel : is_empty() / contains(c)
-alt selection non-empty and c not inside
-  FT --> TR : Consumed   (nothing happens)
-else
-  FT -> F : grid.get(c)
-  F --> FT : seed cell
-  alt seed already has brush.paint in brush.channel
-    FT --> TR : Consumed   (nothing happens, nothing recorded)
+FT -> F : active layer visible?
+alt hidden
+  FT --> TR : Consumed   (nothing happens, status bar: Layer is hidden)
+else visible
+  FT -> Sel : is_empty() / contains(c)
+  alt selection non-empty and c not inside
+    FT --> TR : Consumed   (nothing happens)
   else
-    FT -> FF : region(grid, c, brush.channel, &selection)
-    FF --> FT : Vec<CellCoord>   (see activity diagram 19a)
-    FT -> PB : new(frame_id)
-    loop for each cell k in region
-      FT -> PB : write(project, k, new)\nForeground: Cell{ fg: paint, ..old }   Background: Cell{ bg: Some(paint), ..old }
-      PB -> F : set_cell(k, new)
+    FT -> PB : new(frame_id, active layer id)
+    loop for each plane in options.planes   (Foreground, then Background; each plane is independent)
+      FT -> F : layer.value(plane, c)
+      F --> FT : seed value
+      alt seed already equals the target value of this plane
+        FT -> FT : skip this plane   (nothing to do)
+      else
+        FT -> FF : region(layer, c, plane, &selection)
+        FF --> FT : Vec<CellCoord>   (see activity diagram 19a; the boundary is decided by THIS plane only)
+        loop for each cell k in region
+          FT -> PB : Foreground: write_ink(project, k, InkCell{ glyph: brush.fill_glyph(), color: ink_color })\nBackground: write_fill(project, k, fill_color)
+          PB -> F : set_ink / set_fill
+        end
+      end
     end
     FT -> PB : finish("Fill cells")
-    PB --> FT : Some(CellPatchCommand)
-    FT -> H : record_applied(cmd)
+    alt something changed
+      PB --> FT : Some(CellPatchCommand)
+      FT -> H : record_applied(cmd)   (ONE undo step for both planes)
+    else
+      PB --> FT : None
+    end
     FT --> TR : Consumed
   end
 end
+@enduml
+
+@startuml 13d_seq_pick_color
+!include _style.puml
+title Sequence - Pick a colour from the canvas (Pick tool)
+autonumber
+
+actor User
+participant "CanvasView" as CV
+participant "ToolRegistry" as TR
+participant "PickTool" as PT
+participant "Compositor /\nactive Layer" as Src
+participant "EditorSession" as S
+participant "ToolOptionsBar /\nStatusBar" as UI
+
+User -> CV : click (or drag) on cell c with the Pick tool
+CV -> TR : dispatch(PointerDown(c, mods))   (PointerMove(Some(c)) while the button stays down)
+TR -> PT : on_event(PointerDown(c))
+alt options.planes has no plane switched on
+  PT --> TR : Consumed   (nothing is picked)
+else
+  alt pick_source = Merged
+    PT -> Src : Compositor::flatten_cell(selected frame, c)
+    Src --> PT : FlatCell{ glyph, ink, fill }
+    PT -> PT : ink = cell.ink when cell.glyph != ' '\nfill = cell.fill when cell.fill.a > 0
+  else pick_source = ActiveLayer
+    PT -> Src : layer.ink[c], layer.fill[c]   (works on a hidden layer too)
+    Src --> PT : InkCell, Rgba
+    PT -> PT : ink = ink.color when its glyph != ' '\nfill = fill when its alpha > 0
+  end
+  PT -> PT : keep ink only when planes.foreground, fill only when planes.background
+  PT --> TR : Picked(PickedColors{ ink: Option<Rgba>, fill: Option<Rgba> })
+end
+TR --> CV : ToolResponse::Picked(colours)
+CV -> S : apply_picked(colours)
+opt colours.ink is Some
+  S -> S : set_ink_color(ink)
+end
+opt colours.fill is Some
+  S -> S : set_fill_color(fill)
+end
+opt a requested plane had nothing at c
+  S -> UI : status "No character here" / "No background here"   (that colour is left unchanged)
+end
+UI -> UI : the colour swatches in the top bar show the new colours
+
+note over S
+  Picking never creates a command, never marks the project dirty and ignores the selection.
+  Only colours are copied: the brush / glyph is never changed. The alpha of the picked colour is kept.
+end note
 @enduml

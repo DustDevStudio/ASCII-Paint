@@ -27,16 +27,16 @@ package "Third-party crates" {
 
 component "ffmpeg executable" as FFmpeg <<external process>>
 
-App ..> Core : model, tools, history
+App ..> Core : model, brushes, compose, tools, history
 App ..> Render : GlyphSource, thumbnails
-App ..> IO : repository, recent store, exporters
+App ..> IO : repository, recent + brush stores, importer, exporters
 App ..> Egui
 App ..> Rfd
 App ..> Dirs : default project folder
-Render ..> Core : Frame, CanvasSpec
+Render ..> Core : FlatFrame, CanvasSpec
 Render ..> Fontdue
 IO ..> Core
-IO ..> Render : FrameRasterizer
+IO ..> Render : FrameRasterizer (PNG, MP4)
 IO ..> Zstd
 IO ..> ImageCrate
 IO ..> Serde
@@ -54,30 +54,30 @@ IO ..> IGlyph
 
 note right of Core
   ascii_core: NO dependency on egui, files, threads or the clock.
-  Contains modules model, selection, algo, tools, history.
+  Contains modules model (layers, cell buffer), brush, selection, compose (layer flattening), algo, tools, history.
   100 % unit-testable (tools are driven by ToolEvent values).
   Time is injected (Clock), never read inside the crate.
 end note
 
 note right of IO
-  ascii_io: format (codecs), storage (repository, recent list, atomic writer),
-  export (PNG, .ascii, .aanim, MP4 worker).
+  ascii_io: format (codecs: layered .aspr, flattened .ascii / .aanim), storage (repository, recent list, brush library, atomic writer),
+  import (.txt / .ascii -> cell buffer), export (PNG, .ascii, .aanim, ASCII image sequence worker, MP4 worker).
   Only place that touches the file system or spawns processes.
 end note
 
 note bottom of App
   ascii_app: eframe application, screens, modals, panels, canvas renderer.
-  Threads: the UI thread + at most ONE export worker thread (MP4).
+  Threads: the UI thread + at most ONE export worker thread (ASCII image sequence or MP4).
   Dependency rule: arrows only point downwards / to the left in this diagram. ascii_core never depends on another workspace crate.
 end note
 
 note bottom of Assets
   Suggested source tree
   ascii_paint/Cargo.toml (workspace)
-  crates/ascii_core/src/{model, selection, algo, tools, history}/
+  crates/ascii_core/src/{model, brush, selection, compose, algo, tools, history}/
   crates/ascii_render/src/{glyph_source.rs, rasterizer.rs, thumbnail.rs}
-  crates/ascii_io/src/{format, storage, export}/
-  crates/ascii_app/src/{main.rs, app.rs, modals/, editor/}
+  crates/ascii_io/src/{format, storage, import, export}/
+  crates/ascii_app/src/{main.rs, app.rs, modals/, editor/}   (editor/: canvas, tool_options_bar, tool_panel, frame_panel, layer_panel, ...)
   assets/fonts/
 end note
 @enduml

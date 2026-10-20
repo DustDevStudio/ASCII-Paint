@@ -1,0 +1,98 @@
+@startuml 21a_seq_import_file
+!include _style.puml
+title Sequence - Import a .txt or .ascii file as a new layer (with the "grow the project" suggestion)
+autonumber
+
+actor User
+participant "MenuBar" as MB
+participant "AsciiPaintApp" as App
+participant "FileDialogs" as FD
+participant "ImportService" as Imp
+participant "TextImporter /\nAsciiCodec" as Dec
+participant "ImportModal" as M
+participant "EditorSession" as S
+participant "CellBuffer" as CB
+participant "Command\n(Resize + AddLayer)" as C
+participant "History" as H
+participant "Project / Frame" as P
+participant "Selection" as Sel
+participant "ErrorModal" as Err
+
+User -> MB : File > Import file...
+MB --> App : AppAction::OpenImportModal
+App -> S : playback.pause()
+App -> FD : pick_file(["txt", "ascii"])
+FD --> App : Option<PathBuf>
+
+alt dialog cancelled
+  App -> App : nothing happens
+else path chosen
+  App -> Imp : load(path)
+  alt extension is "txt"
+    Imp -> Dec : TextImporter::parse(bytes)   (activity 20d)
+  else extension is "ascii"
+    Imp -> Dec : AsciiCodec.decode(bytes)   (activity 20b; width x height = the file's canvas cols x rows)
+  else any other extension
+    Imp --> App : Err(UnsupportedType)
+  end
+  alt Err(ImportError)
+    Imp --> App : Err(Io / NotFound / Empty / TooLarge / Format / UnsupportedType)
+    App -> Err : new("Cannot import file", message)
+    App -> App : modal = Error(Err)
+  else Ok
+    Imp --> App : ImportedFile{ kind, name, width, height, warnings }
+    App -> App : fit = project.canvas.fit_content(file.width, file.height)
+    App -> M : new(file, ink = options.ink_color, fit, project.canvas)
+    App -> App : modal = Some(Modal::Import(M))
+    note right of M
+      fit = Fits    -> the dialog offers [Import].
+      fit = TooBig  -> the dialog shows the SUGGESTION "grow the project to <suggested>" and what would be cut off,
+                       with [Resize project and import], [Import without resizing] and [Cancel].
+    end note
+    loop while open
+      opt plain text file
+        User -> M : change the character colour swatch   (ink)
+      end
+    end
+    alt Cancel or Esc
+      M --> App : ModalOutcome::Cancelled
+      App -> App : modal = None   (nothing changes)
+    else [Import]  (fit = Fits)
+      M --> App : Accepted(ApplyImport(request(false)))   (resize = None)
+    else [Resize project and import]  (fit = TooBig, user accepts the suggestion)
+      M --> App : Accepted(ApplyImport(request(true)))   (resize = Some(suggested))
+    else [Import without resizing]  (fit = TooBig, user refuses the suggestion)
+      M --> App : Accepted(ApplyImport(request(false)))   (resize = None: the file is added as a layer, cut off at the page border)
+    end
+  end
+end
+
+opt ApplyImport(req)
+  App -> S : import_content(req.file.to_buffer(req.ink), req.file.name, req.resize)
+  S -> P : selected frame already has 64 layers?
+  alt yes
+    S --> App : Err(TooManyLayers)
+    App -> Err : new("Cannot import", "This frame already has 64 layers.")
+  else no
+    S -> Sel : before = clone()
+    opt req.resize is Some(spec)
+      S -> C : ResizeCanvasCommand::new(project, spec)   (grow only, max 1024 x 1024)
+      S -> Sel : resize(spec)
+    end
+    S -> CB : into_layer(frame.alloc_layer_id(), name, spec)   (full-page layer, content at (0, 0), cells outside the page cut off)
+    S -> C : AddLayerCommand::with_layer(project, frame_id, layer)   (index = active + 1)
+    S -> Sel : apply(buffer.selected_cells((0, 0), spec), Replace)   -> after = clone()
+    S -> H : execute_with_selection(Composite("Import file") [Resize, AddLayer]  or  AddLayer alone, project, SelectionChange{ before, after })
+    H -> C : apply(project)
+    C -> P : resize_canvas(spec): every layer of every frame is padded with empty cells (only when resizing)
+    C -> P : insert_layer(index, layer); select_layer(index)
+    S -> S : options.move_mode = Contents; set_tool(Move)
+    App -> App : modal = None
+  end
+end
+
+note over H
+  ONE undo step: Ctrl+Z removes the new layer, shrinks the canvas back (when it was grown) and restores the previous selection.
+  Importing never touches the file on disk and never changes the other layers or frames (they only get empty cells when the canvas grows).
+end note
+@enduml

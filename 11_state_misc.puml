@@ -15,7 +15,7 @@ Playing --> Playing : tick(now) [elapsed = now - last_advance >= frame_duration]
 Playing --> Stopped : tick(now) [!looping and selected + n >= len - 1]\n/ select(len - 1)
 Playing --> Playing : tick(now) [elapsed < frame_duration]\n/ return Some(frame_duration - elapsed) for request_repaint_after
 Playing --> Stopped : Pause button | toggle_playback
-Playing --> Stopped : add / duplicate / delete / move frame, set background, undo, redo, fps change
+Playing --> Stopped : add / duplicate / delete / move frame, any layer command, paste, import, set background, undo, redo, fps change
 Playing --> Stopped : click on a frame in the list
 Playing --> Stopped : any modal opened | project closed
 
@@ -24,6 +24,7 @@ note bottom
   During Playing the canvas shows the selected frame read-only: no ToolEvent is dispatched, selection ants and tool overlays are hidden.
   Playing never writes to History and never marks the project dirty. Frame advance uses the frame's OWN background colour,
   so a per-frame background change is visible during playback.
+  Every frame is drawn as the composite of ITS visible layers (hidden layers stay hidden).
   Starting playback begins at the currently selected frame (not at frame 1).
 end note
 @enduml
@@ -44,48 +45,43 @@ Dirty --> Dirty : record_applied(cmd) [clean_marker > undo_stack.len() before it
 
 note bottom
   Dirty is a computed property: is_dirty() = clean_marker != Some(undo_stack.len()).
-  Not dirty-making (never recorded): selection changes, zoom/pan, tool or colour changes, switching the selected frame, export, playback.
-  Dirty-making: every Command (cell patches, frame add/duplicate/delete/move, frame background, fps/loop).
+  Not dirty-making (never recorded): selection changes (outline-only move, invert, select all), copy, zoom/pan, tool / brush / colour / option changes,
+  picking colours, brush library changes, switching the selected frame or layer, export, playback.
+  Dirty-making: every Command (cell patches from paint / erase / fill / move / cut / clear, frame add/duplicate/delete/move, frame background, fps/loop,
+  layer add/duplicate/delete/move, layer rename / visibility / opacity, paste, import, canvas resize).
   The window title shows "name *" when dirty. Save As to a NEW path also calls mark_clean() once written.
 end note
 @enduml
 
 @startuml 11c_state_export_job
 !include _style.puml
-title MP4 export job state machine (worker thread, see Mp4Worker in 07)
+title Export job state machine (worker thread: ASCII image sequence or MP4, see ExportWorker in 07)
 
-state Preparing {
-  Preparing : entry / spawn ffmpeg, start stderr drain thread
-}
-state Encoding {
-  Encoding : data / i: u32 (frames written), total: u32
-  Encoding : do / render frame i, write RGBA bytes to ffmpeg stdin, send Progress(i + 1, total)
-}
-state Finalizing {
-  Finalizing : entry / close stdin, child.wait()
-}
-state Cancelling {
-  Cancelling : entry / kill child, delete {out}.part
-}
-state Failed {
-  Failed : entry / kill child if alive, delete {out}.part, send Failed(error)
-}
-state Finished {
-  Finished : entry / rename {out}.part -> {out}, send Finished(path)
-}
-state Cancelled {
-  Cancelled : entry / send Cancelled
-}
+state Preparing
+Preparing : entry / MP4: spawn ffmpeg, start the stderr drain thread | sequence: compute the file names (nothing is created yet)
+state Encoding
+Encoding : data / i: u32 (frames done), total: u32
+Encoding : do / flatten frame i, then MP4: render + write RGBA bytes to ffmpeg stdin | sequence: encode .ascii and write {name}.part;   send Progress(i + 1, total)
+state Finalizing
+Finalizing : entry / MP4: close stdin, child.wait() | sequence: rename every {name}.part to {name}
+state Cancelling
+Cancelling : entry / MP4: kill child, delete {out}.part | sequence: delete every {name}.part written so far
+state Failed
+Failed : entry / MP4: kill child if alive, delete {out}.part | sequence: delete every {name}.part written so far;  send Failed(error)
+state Finished
+Finished : entry / MP4: rename {out}.part -> {out} | send Finished(path)   (path = the .mp4 file, or the folder of the sequence)
+state Cancelled
+Cancelled : entry / send Cancelled
 
-[*] --> Preparing : start_mp4()
-Preparing --> Encoding : ffmpeg spawned
-Preparing --> Failed : spawn error (FfmpegNotFound / Io)
+[*] --> Preparing : start_mp4() | start_ascii_sequence()
+Preparing --> Encoding : MP4: ffmpeg spawned | sequence: names ready
+Preparing --> Failed : MP4: spawn error (FfmpegNotFound / Io)
 Encoding --> Encoding : [i < total and !cancel] frame written
 Encoding --> Cancelling : [cancel flag set] (checked before every frame)
-Encoding --> Failed : stdin write error (ffmpeg died)
+Encoding --> Failed : MP4: stdin write error (ffmpeg died) | sequence: file write or encode error
 Encoding --> Finalizing : [i == total]
-Finalizing --> Finished : exit status == 0
-Finalizing --> Failed : exit status != 0 (FfmpegFailed with stderr tail)
+Finalizing --> Finished : MP4: exit status == 0 | sequence: all renames ok
+Finalizing --> Failed : MP4: exit status != 0 (FfmpegFailed with stderr tail) | sequence: a rename fails
 Cancelling --> Cancelled
 Finished --> [*]
 Failed --> [*]
@@ -93,6 +89,50 @@ Cancelled --> [*]
 
 note as ExportNote
   The UI thread never blocks on the job: AsciiPaintApp.poll_export_job() drains ExportMessage values once per egui frame.
-  The Cancel button only sets the shared AtomicBool; the worker reacts before rendering the next frame.
+  The Cancel button only sets the shared AtomicBool; the worker reacts before processing the next frame.
+  Sequence export: final file names appear only in Finalizing, so a cancelled export or an encode / write error never leaves a half-written sequence and never
+  destroys files that already existed under those names (only a failing rename inside Finalizing can leave a mix; the error names the file).
+  Hidden layers are never part of any export.
+end note
+@enduml
+
+@startuml 11d_state_import
+!include _style.puml
+title Import flow state machine (File > Import file...)
+
+state ChoosingFile
+ChoosingFile : entry / FileDialogs.pick_file(["txt", "ascii"])
+state Decoding
+Decoding : entry / Services.importer.load(path) -> ImportedFile (size in cells, warnings)
+state ReviewFits
+ReviewFits : entry / modal = Import(file, ink = current ink colour, fit = Fits)   buttons: [Import] [Cancel]
+state ReviewTooBig
+ReviewTooBig : entry / modal = Import(file, ink, fit = TooBig(suggested, cut_if_kept, cut_if_resized))\n   shows the SUGGESTION and what would be cut off   buttons: [Resize project and import] [Import without resizing] [Cancel]
+state Applying
+Applying : entry / session.import_content(file.to_buffer(ink), file.name, resize)
+state ShowingError
+ShowingError : entry / modal = Error(ImportError text)
+
+[*] --> ChoosingFile : File > Import file...
+ChoosingFile --> [*] : dialog cancelled
+ChoosingFile --> Decoding : file chosen
+Decoding --> ShowingError : Err(ImportError)
+Decoding --> ReviewFits : Ok [project canvas.fit_content(file.width, file.height) == Fits]
+Decoding --> ReviewTooBig : Ok [file wider OR taller than the project]
+ReviewFits --> ReviewFits : ink swatch changed [plain text only]\n/ ink = colour
+ReviewTooBig --> ReviewTooBig : ink swatch changed [plain text only]\n/ ink = colour
+ReviewFits --> Applying : [Import]\n/ resize = None
+ReviewTooBig --> Applying : [Resize project and import]\n/ resize = Some(suggested)  (grow only, max 1024 x 1024)
+ReviewTooBig --> Applying : [Import without resizing]  (the user refuses the suggestion)\n/ resize = None; the layer is cut off at the page border
+ReviewFits --> [*] : Cancel or Esc
+ReviewTooBig --> [*] : Cancel or Esc
+ShowingError --> [*] : OK
+Applying --> [*] : done
+
+note bottom
+  Applying = ONE undo step (CompositeCommand "Import file" when the canvas grows, AddLayerCommand otherwise): a new layer above the active layer
+  (named after the file) becomes active, its cells become the selection, the Move tool is activated in "Contents" mode so the layer can be dragged into place.
+  Nothing is written to disk by an import. The playback is stopped when the dialog opens.
+  A file that fits is added unchanged at the top-left corner (0, 0).
 end note
 @enduml

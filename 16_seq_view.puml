@@ -83,7 +83,7 @@ loop every egui frame while Playing
   opt Some(wait)
     App -> Ctx : request_repaint_after(wait)
   end
-  note right of App : CanvasRenderer draws the newly selected frame,\nincluding ITS background colour. Editing tools receive no events.
+  note right of App : CanvasRenderer draws the newly selected frame as the composite of ITS visible layers,\nincluding ITS background colour. Editing tools receive no events.
 end
 
 User -> FP : click [Pause] (or any edit / click on a frame / open a modal)

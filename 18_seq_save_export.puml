@@ -37,7 +37,7 @@ end
 
 @startuml 18b_seq_save_as_and_export
 !include _style.puml
-title Sequence - Save as / Export (.aspr, .png, .ascii, .aanim, .mp4) through the Save modal
+title Sequence - Save as / Export (.aspr, .png, .ascii, .aanim, ASCII image sequence, .mp4) through the Save modal
 autonumber
 
 actor User
@@ -59,8 +59,8 @@ App -> M : new(format = ProjectAspr, file_name = project name, folder = parent o
 App -> App : modal = Some(Modal::Save(M)); playback.pause()
 
 loop while open
-  User -> M : choose a format in the list  (Project: .aspr | Current frame: .png, .ascii | All frames: .aanim, .mp4)
-  M -> M : file_name extension follows the format;\nFramePng/FrameAscii default name = "<project>_frame<NNN>" (NNN = 1-based index of the selected frame, 3 digits)
+  User -> M : choose a format in the list  (Project: .aspr | Current frame: .png, .ascii | All frames: .aanim, ASCII image sequence, .mp4)
+  M -> M : file_name extension follows the format;\nFramePng/FrameAscii default name = "<project>_frame<NNN>" (NNN = 1-based index of the selected frame, 3 digits);\nfor the ASCII image sequence the name is the BASE name and `sequence` shows the file list and how many already exist
   opt User clicks "Browse..."
     M -> FD : pick_folder(start = folder)
     FD --> M : Option<PathBuf>
@@ -81,12 +81,17 @@ else Save
     App -> Recent : touch(path, project.meta.name, now)
   else format = FramePng
     App -> X : export_frame_png(&project, path, glyphs)
-    note right of X : renders ONLY the selected frame with ITS OWN background colour;\n1920 x 1080 RGBA8 for the default canvas
+    note right of X : flattens ONLY the selected frame (visible layers, mixed colours) over ITS OWN background colour;\n1920 x 1080 RGBA8 for the default canvas
   else format = FrameAscii
     App -> X : export_frame_ascii(&project, path, glyphs)
+    note right of X : ONE flattened image: visible layers merged, hidden layers left out, no layer data
   else format = AnimationAanim
     App -> X : export_animation_aanim(&project, path, glyphs)
-    note right of X : all frames in timeline order + fps + loop flag
+    note right of X : all frames in timeline order, each flattened + fps + loop flag
+  else format = AnimationAsciiSequence
+    App -> X : start_ascii_sequence(&project, folder, base name, glyphs)
+    X --> App : ExportJobHandle
+    App -> App : export_job = Some(handle); modal = ExportProgress("Exporting frames", done 0 / total N)\n(continues in diagram 18d)
   else format = AnimationMp4
     App -> FL : find()
     alt None
@@ -101,7 +106,7 @@ else Save
   alt synchronous format finished
     X --> App : Ok  (or Repo Ok)
     App -> App : modal = None; toast "Saved <file name>"
-    note right of App : Exports (.png .ascii .aanim .mp4) never change session.path or the dirty state.\nOnly .aspr does.
+    note right of App : Exports (.png .ascii .aanim, sequence, .mp4) never change session.path or the dirty state.\nOnly .aspr does.
   else error
     X --> App : Err(ExportError / RepoError)
     App -> Err : new("Cannot save", message)
@@ -125,14 +130,15 @@ participant "ffmpeg\n(process)" as FF
 participant "Filesystem" as FS
 
 App -> Job : (created by ExportService::start_mp4: channel, cancel flag, thread)
-Job -> W : spawn thread: run(tx, cancel)  with a CLONE of all frames, canvas, fps
+Job -> W : spawn thread: run(tx, cancel)  with a CLONE of all frames (every layer), canvas, fps
 W -> FF : spawn ffmpeg (rawvideo rgba, W x H, framerate fps, libx264, yuv420p, -f mp4 out.mp4.part)
 W -> W : start stderr drain thread (keeps last 4 KiB)
 
 loop for i in 0 .. total
   W -> W : if cancel flag is set -> goto Cancel
-  W -> FR : render(frames[i], canvas, glyphs)
-  FR --> W : RgbaBuffer  (frame background + cell backgrounds + glyphs)
+  W -> W : flat = Compositor::flatten(frames[i], canvas)   (visible layers mixed)
+  W -> FR : render(&flat, canvas, glyphs)
+  FR --> W : RgbaBuffer  (frame background + mixed cell fills + glyphs)
   W -> FF : stdin.write_all(pixels)
   W --> Job : ExportMessage::Progress(i + 1, total)  (mpsc channel)
 end
@@ -172,5 +178,68 @@ note over W
   The editor stays interactive in principle, but the modal blocks input until the job ends.
   Window close during an export: AsciiPaintApp.on_close_requested() sets the cancel flag, joins the worker (which deletes the .part file)
   and then lets the window close. No confirmation dialog is shown for this case.
+end note
+@enduml
+
+@startuml 18d_seq_export_ascii_sequence
+!include _style.puml
+title Sequence - Export all frames as an ASCII image sequence (one .ascii per frame, worker thread)
+autonumber
+
+actor User
+participant "AsciiPaintApp" as App
+participant "ExportProgressModal" as M
+participant "ExportJobHandle" as Job
+participant "AsciiSequenceWorker\n(thread)" as W
+participant "Compositor +\nAsciiCodec" as Enc
+participant "Filesystem" as FS
+
+App -> Job : (created by ExportService::start_ascii_sequence: SequenceNamer::names(base, count), channel, cancel flag, thread)
+Job -> W : spawn thread: run(tx, cancel)  with a CLONE of all frames (every layer), canvas, font_name, folder, names
+note right of W : names[i] = "<base>_frame<NNN>.ascii", NNN = i + 1 zero-padded to max(3, digits(count)).\nNothing is created yet.
+
+loop for i in 0 .. total
+  W -> W : if cancel flag is set -> goto Cancel
+  W -> Enc : flat = Compositor::flatten(frames[i], canvas)   (hidden layers skipped, colours mixed)
+  W -> Enc : AsciiCodec.encode(AsciiImage{ canvas, font_name, frame: flat })
+  Enc --> W : bytes   (the same flattened .ascii bytes a single-frame export writes)
+  W -> FS : write {folder}/{names[i]}.part   (flush + sync_all)
+  W --> Job : ExportMessage::Progress(i + 1, total)
+end
+
+loop every egui frame
+  App -> Job : poll()
+  Job --> App : Vec<ExportMessage>
+  App -> M : done = i + 1 (latest Progress)   (progress bar and "Frame i / N")
+end
+
+alt User clicks Cancel
+  User -> M : click Cancel
+  M --> App : Accepted(AppAction::CancelExport)
+  App -> Job : request_cancel()   (cancel.store(true)); M.cancelling = true
+  W -> FS : delete every {name}.part written so far   (existing files are untouched)
+  W --> Job : ExportMessage::Cancelled
+  App -> App : export_job = None; modal = None
+else all frames written
+  loop for each i
+    W -> FS : rename({names[i]}.part -> {names[i]})   (an existing file with that name is replaced)
+  end
+  alt every rename ok
+    W --> Job : ExportMessage::Finished(folder)
+    App -> App : export_job = None; modal = None; toast "Exported <count> files"
+  else a rename fails (for example the file is locked by another program)
+    W -> FS : delete the {name}.part files that are still waiting
+    W --> Job : ExportMessage::Failed(Io)   (names the file; files already renamed stay)
+    App -> App : export_job = None; modal = ErrorModal("ASCII sequence export failed", message)
+  end
+else encode or write error while writing a .part file
+  W -> FS : delete every {name}.part written so far
+  W --> Job : ExportMessage::Failed(Format / Io)
+  App -> App : export_job = None; modal = ErrorModal("ASCII sequence export failed", message)
+end
+note over W
+  The final names appear only in the short rename step, so a cancelled export or an encode / write error never leaves a half-written sequence
+  and never destroys older files. Only a failure inside the rename step can leave a mix of new and old files; the error names the file.
+  Window close during an export: AsciiPaintApp.on_close_requested() sets the cancel flag and joins the worker (which deletes the .part files).
 end note
 @enduml

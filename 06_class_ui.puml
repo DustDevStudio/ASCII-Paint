@@ -20,9 +20,12 @@ package "ascii_app::app" {
   class Services <<struct>> {
     + recent: RecentStore
     + projects: ProjectRepository
+    + brushes: BrushStore
+    + importer: ImportService
     + exporter: ExportService
     + glyphs: Arc<dyn GlyphSource>
     + dialogs: FileDialogs
+    + clipboard: SharedClipboard
     + clock: Clock
   }
 
@@ -58,15 +61,20 @@ package "ascii_app::app" {
     QuickSave
     SaveAs(SaveRequest)
     OpenColorPicker(ColorPickTarget)
-    ApplyColor(ColorPickTarget, Option<Rgb>, bool)
+    ApplyColor(ColorPickTarget, Rgba, bool)
+    OpenBrushEditor(Option<BrushId>)
+    SaveBrush(Brush)
+    DeleteBrush(BrushId)
+    OpenImportModal
+    ApplyImport(ImportRequest)
     ConfirmUnsaved(UnsavedChoice)
     CancelExport
     CloseModal
   }
 
   enum ColorPickTarget <<enum>> {
-    PaintColor
-    EraseColor
+    InkColor
+    FillColor
     FrameBackground(FrameId)
   }
 
@@ -83,6 +91,12 @@ package "ascii_app::app" {
     + fps: Fps
   }
 
+  class ImportRequest <<struct>> {
+    + file: ImportedFile
+    + ink: Rgba
+    + resize: Option<CanvasSpec>
+  }
+
   class SaveRequest <<struct>> {
     + format: SaveFormat
     + path: PathBuf
@@ -93,6 +107,7 @@ package "ascii_app::app" {
     FramePng
     FrameAscii
     AnimationAanim
+    AnimationAsciiSequence
     AnimationMp4
     + extension() -> &str
     + scope() -> SaveScope
@@ -123,6 +138,8 @@ package "ascii_app::modals" {
     NewProject(NewProjectModal)
     RecentProjects(RecentProjectsModal)
     ColorPicker(ColorPickerModal)
+    BrushEditor(BrushEditorModal)
+    Import(ImportModal)
     Save(SaveModal)
     ConfirmUnsaved(ConfirmUnsavedModal)
     ExportProgress(ExportProgressModal)
@@ -151,10 +168,31 @@ package "ascii_app::modals" {
 
   class ColorPickerModal <<struct>> {
     - target: ColorPickTarget
-    - original: Option<Rgb>
-    - working: Option<Rgb>
-    - allow_transparent: bool
+    - original: Rgba
+    - working: Rgba
+    - allow_alpha: bool
     - apply_to_all: bool
+  }
+
+  class BrushEditorModal <<struct>> {
+    - editing: Option<BrushId>
+    - name: String
+    - width: u8
+    - height: u8
+    - cells: Vec<String>
+    - anchor: (u8, u8)
+    - missing_glyphs: Vec<char>
+    - error: Option<String>
+    + to_brush() -> Result<Brush, BrushError>
+  }
+
+  class ImportModal <<struct>> {
+    - file: ImportedFile
+    - ink: Rgba
+    - fit: ImportFit
+    - project_canvas: CanvasSpec
+    - error: Option<String>
+    + request(resize: bool) -> ImportRequest
   }
 
   class SaveModal <<struct>> {
@@ -162,8 +200,17 @@ package "ascii_app::modals" {
     - file_name: String
     - folder: PathBuf
     - ffmpeg_available: bool
+    - frame_count: usize
+    - sequence: Option<SequencePlan>
     - error: Option<String>
     + validate() -> Result<SaveRequest, SaveFormError>
+  }
+
+  class SequencePlan <<struct>> {
+    + count: usize
+    + first_name: String
+    + last_name: String
+    + existing: usize
   }
 
   class ConfirmUnsavedModal <<struct>> {
@@ -171,6 +218,7 @@ package "ascii_app::modals" {
   }
 
   class ExportProgressModal <<struct>> {
+    - title: String
     - done: u32
     - total: u32
     - cancelling: bool
@@ -195,6 +243,8 @@ ModalOutcome ..> AppAction
 Modal *-- NewProjectModal
 Modal *-- RecentProjectsModal
 Modal *-- ColorPickerModal
+Modal *-- BrushEditorModal
+Modal *-- ImportModal
 Modal *-- SaveModal
 Modal *-- ConfirmUnsavedModal
 Modal *-- ExportProgressModal
@@ -202,6 +252,8 @@ Modal *-- ErrorModal
 ModalView <|.. NewProjectModal
 ModalView <|.. RecentProjectsModal
 ModalView <|.. ColorPickerModal
+ModalView <|.. BrushEditorModal
+ModalView <|.. ImportModal
 ModalView <|.. SaveModal
 ModalView <|.. ConfirmUnsavedModal
 ModalView <|.. ExportProgressModal
@@ -209,14 +261,19 @@ ModalView <|.. ErrorModal
 RecentProjectsModal *-- "0..10" RecentRow
 NewProjectModal ..> NewProjectParams : produces
 SaveModal ..> SaveRequest : produces
+SaveModal *-- "0..1" SequencePlan
+ImportModal ..> ImportRequest : produces
 SaveRequest *-- SaveFormat
 SaveFormat ..> SaveScope
 AppAction ..> NewProjectParams
 AppAction ..> SaveRequest
+AppAction ..> ImportRequest
 AppAction ..> ColorPickTarget
 AppAction ..> UnsavedChoice
 ColorPickerModal *-- ColorPickTarget
 Services ..> ProjectRepository
+Services ..> BrushStore
+Services ..> ImportService
 Services ..> FileDialogs
 Services ..> RecentStore
 Services ..> ExportService
@@ -233,13 +290,19 @@ note as N1
   Only ONE modal exists at a time. Opening a modal while one is open replaces it, EXCEPT ErrorModal which is shown
   after the current modal is closed (it replaces the current one only when the current one is NewProject/Save and the
   error came from its own action).
+  Actions handled by the app because they need a service (see sequences 13b and 21a):
+    OpenBrushEditor / SaveBrush / DeleteBrush -> Services.brushes (BrushStore persists brushes.json), then session.set_brush_library(copy).
+    OpenImportModal -> FileDialogs.pick_file(["txt", "ascii"]) -> Services.importer.load(path) -> ImportModal.
+    ApplyImport(req) -> session.import_content(req.file.to_buffer(req.ink), req.file.name, req.resize).
 end note
 
 note as N2
-  - original / working: Option<Rgb>. None means "transparent" and is only offered when allow_transparent (= EraseColor target).
-  - UI: RGB sliders 0-255, hex field (#RRGGBB, validated live with Rgb::from_hex), 16 preset swatches, old/new preview.
+  - original / working: Rgba. UI: RGB sliders 0-255, an Alpha slider 0-255 (only when allow_alpha), hex field (#RRGGBB, or #RRGGBBAA when allow_alpha,
+    validated live with Rgb::from_hex / Rgba::from_hex), 16 preset swatches, old/new preview drawn over a checkerboard so transparency is visible.
+  - allow_alpha = true for InkColor and FillColor, false for FrameBackground (alpha is forced to 255 and the result is stored as Rgb).
   - "Apply to all frames" checkbox is only shown for ColorPickTarget::FrameBackground.
   - OK -> Accepted(ApplyColor(target, working, apply_to_all)).  Cancel / Esc -> Cancelled (nothing changes).
+    InkColor -> session.set_ink_color, FillColor -> session.set_fill_color, FrameBackground -> session.set_frame_background(id, working.rgb(), all).
 end note
 
 note as N3
@@ -249,26 +312,57 @@ note as N3
   - target file = folder/name.aspr must NOT exist -> error "A project with this name already exists in this folder."
   - background: initial background colour of frame 1 (default #000000), edited with the same ColorPickerModal-style widget inline.
   - fps: 1..=60 (default 12).
-  - canvas: shown read-only as "240 x 72 cells - 8 x 15 px" (not editable in this milestone).
+  - canvas: shown read-only as "240 x 72 cells - 8 x 15 px" (the canvas can only grow later, through the import suggestion).
 end note
 
 note as N4
-  - Format list grouped by scope:  Project: .aspr  |  Current frame: .png, .ascii  |  All frames: .aanim, .mp4.
+  - Format list grouped by scope:  Project: .aspr  |  Current frame: .png, .ascii  |  All frames: .aanim, ASCII image sequence (.ascii per frame), .mp4.
+  - Everything except .aspr is a FLATTENED export: visible layers are composited, hidden layers are left out.
   - AnimationMp4 is disabled (greyed, tooltip "ffmpeg not found") when FfmpegLocator::find() returned None.
   - Default file name = project name (+ "_frame" + 3-digit 1-based index for FramePng / FrameAscii); extension follows the format.
-  - Save is enabled when folder exists, file_name is a valid file name (same rules as project name) .
+    For AnimationAsciiSequence the file name field is the BASE name: the files are <base>_frame001.ascii ... <base>_frameNNN.ascii in the chosen folder
+    (digits = max(3, digits of the frame count)). `sequence` is recomputed live and shown as "12 files: name_frame001.ascii ... name_frame012.ascii".
+  - Save is enabled when folder exists, file_name is a valid file name (same rules as project name).
   - If the file already exists a confirmation line "File exists - it will be replaced" is shown (no extra dialog).
+    For a sequence the line reads "3 of 12 files exist - they will be replaced" (sequence.existing).
 end note
 
+note as N5
+  ImportModal (opened by AsciiPaintApp after the file was chosen and decoded, see diagram 21a and the state machine 11d)
+  - Shows file name, kind (plain text / .ascii image), file size in cells (file.width x file.height) and the project canvas.
+  - Plain text only: an ink colour swatch (default = current ink colour, opens the ColorPickerModal-style widget inline).
+    .ascii files keep their own colours; their frame background colour is ignored.
+  - fit = project_canvas.fit_content(file.width, file.height).
+      Fits   -> one button [Import].
+      TooBig -> the SUGGESTION panel: "The file is 300 x 90 cells, the project is 240 x 72."
+                [Resize project to 300 x 90 and import]  [Import without resizing]  [Cancel]
+                Without resizing it also says what is lost: "60 columns and 18 rows will be cut off."
+                When the suggestion is capped at 1024 the panel adds what is still cut off after resizing.
+  - request(true) -> ImportRequest{ resize: Some(suggested) },  request(false) -> ImportRequest{ resize: None }.
+    [Import without resizing] is the "user refuses" path: the file is simply added as a layer, cut off at the page border.
+end note
+
+note as N6
+  BrushEditorModal - the only place where characters are typed
+  - Name field, Width / Height (1..=8), a grid of single-character text fields (empty field = None, the stamp cell does nothing),
+    and an anchor picker (click a cell with the secondary button, or the Anchor radio row). A live preview paints the stamp with the current ink colour.
+  - missing_glyphs: characters the font cannot draw (GlyphSource::contains == false) are listed with a warning; they are still allowed ('?' is drawn).
+  - Save is enabled when to_brush() validates (see Brush::validate in diagram 04). Accepted(SaveBrush(brush)); editing = Some(id) keeps the id.
+  - Built-in brushes open the editor as a copy (name "<name> copy"): they cannot be modified.
+end note
 
 ' ---- rule notes: attached to their class, stacked in one column (hidden links) ----
 AsciiPaintApp .. N1
 ColorPickerModal .. N2
 NewProjectModal .. N3
 SaveModal .. N4
+ImportModal .. N5
+BrushEditorModal .. N6
 N1 -[hidden]down-> N2
 N2 -[hidden]down-> N3
 N3 -[hidden]down-> N4
+N4 -[hidden]down-> N5
+N5 -[hidden]down-> N6
 @enduml
 
 @startuml 06b_class_editor_screen
@@ -280,11 +374,13 @@ package "ascii_app::editor" {
   class EditorScreen <<struct>> {
     - session: EditorSession
     - menu: MenuBar
+    - options_bar: ToolOptionsBar
     - tool_panel: ToolPanel
     - canvas: CanvasView
     - frame_panel: FramePanel
+    - layer_panel: LayerPanel
     - status: StatusBar
-    + new(project: Project, path: PathBuf, glyphs: Arc<dyn GlyphSource>) -> EditorScreen
+    + new(project: Project, path: PathBuf, glyphs: Arc<dyn GlyphSource>, brushes: BrushLibrary, clipboard: SharedClipboard) -> EditorScreen
     + ui(ctx: &egui::Context) -> Vec<AppAction>
     + handle_shortcuts(ctx: &egui::Context) -> Vec<AppAction>
   }
@@ -295,16 +391,25 @@ package "ascii_app::editor" {
     + history: History
     + selection: Selection
     + tools: ToolRegistry
-    + brush: Brush
+    + options: ToolOptions
+    + brushes: BrushLibrary
+    + clipboard: SharedClipboard
     + viewport: Viewport
     + playback: PlaybackController
     + thumbnails: ThumbnailCache
     + show_grid: bool
     + is_dirty() -> bool
     + set_tool(id: ToolId)
-    + set_paint_color(c: Rgb)
-    + set_erase_color(c: Option<Rgb>)
-    + set_channel(ch: PaintChannel)
+    + set_brush(id: BrushId)
+    + set_brush_library(lib: BrushLibrary)
+    + set_planes(p: PlaneSet)
+    + set_ink_color(c: Rgba)
+    + set_fill_color(c: Rgba)
+    + set_erase_size(n: u8)
+    + set_selection_mode(m: SelectionMode)
+    + set_move_mode(m: MoveMode)
+    + set_pick_source(s: PickSource)
+    + apply_picked(p: PickedColors)
     + select_frame(i: usize)
     + add_frame()
     + duplicate_frame()
@@ -313,18 +418,57 @@ package "ascii_app::editor" {
     + set_frame_background(id: FrameId, c: Rgb, all_frames: bool)
     + set_fps(f: Fps)
     + set_looping(on: bool)
+    + select_layer(i: usize)
+    + add_layer()
+    + duplicate_layer()
+    + delete_layer()
+    + move_layer(from: usize, to: usize)
+    + set_layer_props(id: LayerId, p: LayerProps)
     + undo()
     + redo()
+    + invert_selection()
     + delete_selection_contents()
+    + copy(merged: bool)
+    + cut()
+    + paste()
+    + import_content(buf: CellBuffer, name: String, resize: Option<CanvasSpec>)
     + toggle_playback(now: Instant)
+    - place_buffer_as_layer(buf: CellBuffer, name: String, resize: Option<CanvasSpec>)
   }
+
+  class Clipboard <<struct>> {
+    - buffer: Option<CellBuffer>
+    + set(b: CellBuffer)
+    + get() -> Option< &CellBuffer>
+    + has_content() -> bool
+  }
+
+  class SharedClipboard <<type alias>>
 
   class MenuBar <<struct>> {
     + ui(ui: &mut egui::Ui, s: &mut EditorSession) -> Vec<AppAction>
   }
 
-  class ToolPanel <<struct>> {
+  class ToolOptionsBar <<struct>> {
     + ui(ui: &mut egui::Ui, s: &mut EditorSession) -> Vec<AppAction>
+    + {static} sections_for(tool: ToolId) -> &[OptionSection]
+  }
+
+  enum OptionSection <<enum>> {
+    BrushPicker
+    PlaneToggles
+    InkColor
+    FillColor
+    EraseSize
+    SelectionModeButtons
+    SelectionActions
+    MoveModeButtons
+    PickSourceButtons
+    Hint(text: &str)
+  }
+
+  class ToolPanel <<struct>> {
+    + ui(ui: &mut egui::Ui, s: &mut EditorSession)
   }
 
   class FramePanel <<struct>> {
@@ -333,6 +477,17 @@ package "ascii_app::editor" {
   }
 
   class FrameDrag <<struct>> {
+    + from: usize
+    + hover_slot: usize
+  }
+
+  class LayerPanel <<struct>> {
+    - drag: Option<LayerDrag>
+    - renaming: Option<LayerId>
+    + ui(ui: &mut egui::Ui, s: &mut EditorSession)
+  }
+
+  class LayerDrag <<struct>> {
     + from: usize
     + hover_slot: usize
   }
@@ -351,6 +506,7 @@ package "ascii_app::editor" {
 
   class CanvasRenderer <<struct>> {
     - atlas: GlyphAtlas
+    - flat_cache: Option<(FrameId, u64, FlatFrame)>
     - edges_cache: Option<(u64, Vec<EdgeSegment>)>
     + paint(painter: &egui::Painter, rect: egui::Rect, s: &EditorSession)
   }
@@ -409,29 +565,38 @@ package "ascii_app::editor" {
 
 EditorScreen *-- EditorSession
 EditorScreen *-- MenuBar
+EditorScreen *-- ToolOptionsBar
 EditorScreen *-- ToolPanel
 EditorScreen *-- CanvasView
 EditorScreen *-- FramePanel
+EditorScreen *-- LayerPanel
 EditorScreen *-- StatusBar
 EditorSession *-- Project
 EditorSession *-- History
 EditorSession *-- Selection
 EditorSession *-- ToolRegistry
-EditorSession *-- Brush
+EditorSession *-- ToolOptions
+EditorSession *-- BrushLibrary
+EditorSession o-- SharedClipboard
 EditorSession *-- Viewport
 EditorSession *-- PlaybackController
 EditorSession *-- ThumbnailCache
+SharedClipboard ..> Clipboard : Rc<RefCell<..>>
 PlaybackController *-- PlaybackState
 ThumbnailCache *-- "0..*" ThumbEntry
 FramePanel *-- "0..1" FrameDrag
+LayerPanel *-- "0..1" LayerDrag
+ToolOptionsBar ..> OptionSection
 CanvasView *-- CanvasRenderer
 CanvasRenderer *-- GlyphAtlas
 CanvasRenderer ..> Viewport : uses
 CanvasView ..> ToolEvent : produces
 CanvasView ..> ToolRegistry : dispatch()
 MenuBar ..> EditorSession
+ToolOptionsBar ..> EditorSession
 ToolPanel ..> EditorSession
 FramePanel ..> EditorSession
+LayerPanel ..> EditorSession
 
 note as N1
   EditorSession is the single source of truth while a project is open. UI widgets mutate it ONLY through these methods.
@@ -439,10 +604,24 @@ note as N1
   - set_frame_background(id, c, all_frames): all_frames=false -> SetFrameBackgroundCommand (skipped when colour unchanged);
       all_frames=true -> CompositeCommand of one SetFrameBackgroundCommand per differing frame. history.execute().
   - set_fps() / set_looping(): SetPlaybackSettingsCommand. select_frame(i): timeline.select(i) (not undoable), keeps the selection mask.
-  - undo()/redo(): see History rules; they also stop playback first.
-  - delete_selection_contents(): when selection is non-empty, clears every selected cell of the current frame
-      with ClearOperation inside ONE PatchBuilder ("Clear selection").
+  - Layers act on the SELECTED frame: select_layer(i) = frame.select_layer(i) (not undoable). add_layer() / duplicate_layer() / delete_layer() /
+    move_layer() / set_layer_props() build AddLayerCommand / DeleteLayerCommand / MoveLayerCommand / SetLayerPropsCommand and history.execute().
+  - undo()/redo(): see History rules; they stop playback first, apply UndoStep.selection with Selection::restore() when it is Some.
+  - invert_selection(): selection.invert() (not undoable). delete_selection_contents(): when the selection is non-empty, clears BOTH planes of every
+      selected cell of the active layer inside ONE PatchBuilder ("Clear selection"); needs a visible active layer.
+  - copy(merged): needs a non-empty selection. merged = false -> CellBuffer::extract(active layer, selection); merged = true -> CellBuffer::extract_flat(
+      Compositor::flatten(frame), selection). Stored with clipboard.set(). Not undoable, not dirty-making.
+  - cut(): copy(false) then delete the selected cells through one PatchBuilder with label "Cut".
+  - paste(): needs clipboard content. place_buffer_as_layer(buffer.clone(), "Pasted selection", None).
+  - import_content(buf, name, resize): place_buffer_as_layer(buf, name, resize). Both share the same path:
+      1. spec = resize.unwrap_or(project.canvas).  layer = buf.into_layer(frame.alloc_layer_id(), name, spec)  (cells outside the page are cut off).
+      2. cmd = AddLayerCommand::with_layer(...); with resize: CompositeCommand("Import file") [ResizeCanvasCommand, cmd]; label "Paste layer" otherwise.
+      3. before = selection.clone(); selection.resize(spec) when resized; selection.apply(buf.selected_cells((0, 0) offset, spec), Replace); after = selection.clone().
+      4. history.execute_with_selection(cmd, project, SelectionChange{ before, after }).
+      5. options.move_mode = Contents; set_tool(Move)  - the new layer is active and its cells are selected, so the user can drag it into place at once.
+  - apply_picked(p): the only way the Pick tool changes anything: p.ink -> set_ink_color, p.fill -> set_fill_color. Not undoable, not dirty-making.
   - toggle_playback(): see state diagram 11 (playback). Starting playback cancels any busy tool.
+  - set_brush_library(lib): replaces the brush list; if options.brush no longer exists it falls back to BrushLibrary::default_id().
 end note
 
 note as N2
@@ -457,30 +636,36 @@ note as N2
   - fit(): zoom = clamp(min(view.w / page_w, view.h / page_h) * 0.95, MIN, MAX); page centred in the view.
   - actual_size(): zoom = 1.0 (1 page pixel = 1 screen pixel); page centred.
   - zoom_step(+1/-1): z' = clamp(zoom * 1.25^dir) around the view centre. A new Editor opens with fit().
+  - After an import resized the canvas the viewport keeps zoom and origin (the page just gets bigger to the right / bottom).
 end note
 
 note as N3
   Input mapping (translate_input)
   - Mouse wheel over the canvas = zoom_at(cursor, scroll_y / 50.0). (Never scrolls.)
   - Middle-button drag, or Space held + left drag = pan_by(drag delta). Space-pan suppresses tool events.
-  - Primary button -> ToolEvent::PointerDown / PointerMove / PointerUp / DoubleClick with cell = screen_to_cell(...).
-  - Typed text (egui Event::Text, printable only) -> ToolEvent::Text; Enter/Backspace/Delete/Arrows/Escape -> ToolEvent::Key.
-    Only when the canvas has keyboard focus (clicking the canvas gives focus; text fields elsewhere take it away).
+  - Primary button and plain pointer movement -> ToolEvent::PointerDown / PointerMove / PointerUp / DoubleClick with cell = screen_to_cell(...).
+    PointerMove is also sent while no button is pressed (hover previews).
+  - Enter/Backspace/Delete/Arrows/Escape -> ToolEvent::Key, only when the canvas has keyboard focus (clicking the canvas gives focus; text fields
+    elsewhere take it away). There is NO character typing on the canvas: printable keys are not translated.
   - Returns the hovered cell for the StatusBar.
+  - When dispatch() answers ToolResponse::Picked(colours), CanvasView calls session.apply_picked(colours) (ink -> set_ink_color, fill -> set_fill_color).
   - Painting order: see CanvasRenderer note.
 end note
 
 note as N4
   paint() draw order (only the cells returned by Viewport::visible_cells are visited)
+  0. flat = cached Compositor::flatten(selected frame), recomputed only when (frame id, Frame.revision) changed. Hidden layers are not part of it.
   1. Dark neutral workspace fill (#2B2B2B) over the whole widget.
   2. PAGE: filled rect with timeline.selected_frame().background.
-  3. For each visible cell: if bg = Some(c) fill cell rect with c.
-  4. For each visible cell with glyph != ' ': textured quad from GlyphAtlas::uv(glyph), tinted with fg.
+  3. For each visible cell with flat.fill.a > 0: fill the cell rect with flat.fill (straight alpha, drawn over the page colour).
+  4. For each visible cell with glyph != ' ': textured quad from GlyphAtlas::uv(glyph), tinted with flat.ink (straight alpha -> premultiplied for egui).
   5. Grid lines (1 px, white at 12% opacity) when show_grid && zoom >= 2.0.
   6. Selection: boundary_edges() (cached by Selection::revision) as 1.5 px dashed black/white "marching ants".
-  7. Tool overlay: text cursor (blinking 500 ms), rect/ellipse preview, polygon rubber-band, hovered-cell outline.
+  7. Tool overlay: brush footprint outline (Paint / Erase hover), rect/ellipse preview, polygon rubber-band, hovered-cell outline, and for the Move tool the
+     floating cells drawn on top of everything at their offset plus the shifted selection outline.
   8. Page border (1 px #000000 at 60%).
   While Playing, steps 6-7 are skipped. The glyph cache key is only the char, the colour is applied by the vertex tint.
+  The active layer is not highlighted on the canvas; the canvas always shows the composited result.
 end note
 
 note as N5
@@ -491,7 +676,7 @@ end note
 note as N6
   Layout (top to bottom): header "Frames" | scrollable list of FrameItem | [+ Add] [Duplicate] [Delete] |
   separator | "Background" swatch + hex text of the SELECTED frame | FPS field | [Play/Pause] [x] Loop.
-  - FrameItem = 1-based index label + thumbnail (ThumbnailCache) + highlight when selected. Click = select_frame(i).
+  - FrameItem = 1-based index label + thumbnail (ThumbnailCache, composited result) + highlight when selected. Click = select_frame(i).
   - Drag a FrameItem: FrameDrag{from, hover_slot}; on release, if hover_slot != from -> move_frame(from, to).
   - Delete is disabled when timeline.len() == 1. Add inserts AFTER the selected frame and selects it.
   - Background swatch click -> AppAction::OpenColorPicker(ColorPickTarget::FrameBackground(selected frame id)).
@@ -500,6 +685,47 @@ note as N6
   - All edit buttons are disabled while Playing, except Play/Pause itself and frame selection (which stops playback).
 end note
 
+note as N7
+  ToolOptionsBar = the top bar under the menu. It shows the sections of the ACTIVE tool and edits session.options only through the session setters.
+  sections_for(tool):
+    Paint  : BrushPicker, PlaneToggles, InkColor, FillColor
+    Fill   : BrushPicker, PlaneToggles, InkColor, FillColor            (the picked brush supplies the fill character)
+    Pick   : PlaneToggles, PickSourceButtons, Hint("Click a cell. Foreground picks its character colour, Background picks its background colour.")
+    Erase  : EraseSize, PlaneToggles
+    SelectRect / SelectPolygon / SelectEllipse : SelectionModeButtons, SelectionActions
+    Move   : MoveModeButtons, SelectionActions, Hint("Drag inside the selection. Arrow keys nudge, Shift = 10 cells.")
+  - BrushPicker: drop-down listing the brushes with a small stamp preview, then [New...] [Edit...] [Delete]
+    (-> OpenBrushEditor(None) / OpenBrushEditor(Some(id)) / DeleteBrush(id); Edit and Delete are disabled for built-in brushes except that Edit opens a copy).
+  - PlaneToggles: two toggle buttons [Foreground] [Background]; both may be on. They decide which plane(s) Paint, Fill and Erase write.
+  - InkColor / FillColor: swatches (drawn over a checkerboard, alpha visible) -> OpenColorPicker(InkColor / FillColor).
+  - EraseSize: DragValue 1..=16.
+  - SelectionModeButtons: [Replace] [Add] [Subtract] (a held Shift / Alt overrides the button).  SelectionActions: [All] [None] [Invert] (Invert disabled with no selection).
+  - MoveModeButtons: [Contents] [Outline only].  PickSourceButtons: [Merged] [Active layer].
+  - The PlaneToggles of the Pick tool are the same toggles as Paint's: they choose which colour is picked (Foreground -> ink colour, Background -> fill colour).
+  - Everything is disabled while Playing.
+end note
+
+note as N8
+  LayerPanel (right side, under the Frames panel). Lists the layers of the SELECTED frame TOP FIRST (row 0 = layers[len - 1]).
+  - LayerRow = eye checkbox (visible) + name label (double-click to rename: LayerPanel.renaming, commit on Enter / focus loss) + highlight when active.
+    Click a row = select_layer(index). Eye click = set_layer_props(visible toggled).
+  - Under the list, for the ACTIVE layer: Opacity slider 0-100 % (commits on release through set_layer_props).
+  - Buttons: [+ Add] [Duplicate] [Delete]. Add and Duplicate are disabled at 64 layers, Delete when the frame has one layer.
+  - Drag a LayerRow: LayerDrag{from, hover_slot} (row positions). On release the panel converts rows to layer indices (index = len - 1 - row)
+    and calls move_layer(from, to) when the position changed.
+  - A hidden active layer shows a small "hidden" badge; tools refuse to write into it.
+  - All buttons and edits are disabled while Playing.
+end note
+
+note as N9
+  Menus (MenuBar)
+  File   : Open recent... | Save (Ctrl+S) | Save as / Export... | Import file... | Close project
+  Edit   : Undo (Ctrl+Z) | Redo (Ctrl+Y) | Cut (Ctrl+X) | Copy (Ctrl+C) | Copy merged (Ctrl+Shift+C) | Paste (Ctrl+V) | Clear selection contents (Delete)
+  Select : All (Ctrl+A) | None (Ctrl+D) | Invert (Ctrl+Shift+I)
+  View   : Zoom in (Ctrl+=) | Zoom out (Ctrl+-) | Fit to window (Ctrl+0) | Actual size (Ctrl+1) | Show cell grid
+  Cut / Copy / Copy merged / Clear need a non-empty selection, Paste needs clipboard content. The shortcuts are handled by
+  EditorScreen::handle_shortcuts, never by a tool.
+end note
 
 ' ---- rule notes: attached to their class, stacked in one column (hidden links) ----
 EditorSession .. N1
@@ -508,9 +734,15 @@ CanvasView .. N3
 CanvasRenderer .. N4
 PlaybackController .. N5
 FramePanel .. N6
+ToolOptionsBar .. N7
+LayerPanel .. N8
+MenuBar .. N9
 N1 -[hidden]down-> N2
 N2 -[hidden]down-> N3
 N3 -[hidden]down-> N4
 N4 -[hidden]down-> N5
 N5 -[hidden]down-> N6
+N6 -[hidden]down-> N7
+N7 -[hidden]down-> N8
+N8 -[hidden]down-> N9
 @enduml

@@ -11,15 +11,17 @@ package "ascii_core::history" {
   }
 
   class History <<struct>> {
-    - undo_stack: Vec<Box<dyn Command>>
-    - redo_stack: Vec<Box<dyn Command>>
+    - undo_stack: Vec<HistoryEntry>
+    - redo_stack: Vec<HistoryEntry>
     - limit: usize = 200
     - clean_marker: Option<usize>
     + new() -> History
     + execute(cmd: Box<dyn Command>, project: &mut Project)
+    + execute_with_selection(cmd: Box<dyn Command>, project: &mut Project, sel: SelectionChange)
     + record_applied(cmd: Box<dyn Command>)
-    + undo(project: &mut Project) -> Option<String>
-    + redo(project: &mut Project) -> Option<String>
+    + record_applied_with_selection(cmd: Box<dyn Command>, sel: SelectionChange)
+    + undo(project: &mut Project) -> Option<UndoStep>
+    + redo(project: &mut Project) -> Option<UndoStep>
     + can_undo() -> bool
     + can_redo() -> bool
     + undo_label() -> Option< &str >
@@ -28,15 +30,38 @@ package "ascii_core::history" {
     + is_dirty() -> bool
   }
 
-  class CellChange <<struct, Copy>> {
+  class HistoryEntry <<struct>> {
+    + cmd: Box<dyn Command>
+    + selection: Option<SelectionChange>
+  }
+
+  class SelectionChange <<struct, Clone>> {
+    + before: Selection
+    + after: Selection
+  }
+
+  class UndoStep <<struct>> {
+    + label: String
+    + selection: Option<Selection>
+  }
+
+  class InkChange <<struct, Copy>> {
     + coord: CellCoord
-    + before: Cell
-    + after: Cell
+    + before: InkCell
+    + after: InkCell
+  }
+
+  class FillChange <<struct, Copy>> {
+    + coord: CellCoord
+    + before: Rgba
+    + after: Rgba
   }
 
   class CellPatchCommand <<struct>> {
     + frame_id: FrameId
-    + changes: Vec<CellChange>
+    + layer_id: LayerId
+    + ink_changes: Vec<InkChange>
+    + fill_changes: Vec<FillChange>
     + label: String
   }
 
@@ -75,6 +100,45 @@ package "ascii_core::history" {
     + after_looping: bool
   }
 
+  class AddLayerCommand <<struct>> {
+    + frame_id: FrameId
+    + index: usize
+    + layer: Layer
+    + active_before: usize
+    + {static} blank_above(project: &mut Project, frame_id: FrameId) -> Result<AddLayerCommand, DomainError>
+    + {static} duplicate(project: &mut Project, frame_id: FrameId, index: usize) -> Result<AddLayerCommand, DomainError>
+    + {static} with_layer(project: &Project, frame_id: FrameId, layer: Layer) -> Result<AddLayerCommand, DomainError>
+  }
+
+  class DeleteLayerCommand <<struct>> {
+    + frame_id: FrameId
+    + index: usize
+    + layer: Layer
+    + active_before: usize
+    + {static} new(project: &Project, frame_id: FrameId, index: usize) -> Result<DeleteLayerCommand, DomainError>
+  }
+
+  class MoveLayerCommand <<struct>> {
+    + frame_id: FrameId
+    + from: usize
+    + to: usize
+    + active_before: usize
+  }
+
+  class SetLayerPropsCommand <<struct>> {
+    + frame_id: FrameId
+    + layer_id: LayerId
+    + before: LayerProps
+    + after: LayerProps
+    + {static} new(project: &Project, frame_id: FrameId, layer_id: LayerId, after: LayerProps) -> Option<SetLayerPropsCommand>
+  }
+
+  class ResizeCanvasCommand <<struct>> {
+    + before: CanvasSpec
+    + after: CanvasSpec
+    + {static} new(project: &Project, after: CanvasSpec) -> Option<ResizeCanvasCommand>
+  }
+
   class CompositeCommand <<struct>> {
     + label: String
     + children: Vec<Box<dyn Command>>
@@ -87,49 +151,69 @@ Command <|.. AddFrameCommand
 Command <|.. DeleteFrameCommand
 Command <|.. MoveFrameCommand
 Command <|.. SetPlaybackSettingsCommand
+Command <|.. AddLayerCommand
+Command <|.. DeleteLayerCommand
+Command <|.. MoveLayerCommand
+Command <|.. SetLayerPropsCommand
+Command <|.. ResizeCanvasCommand
 Command <|.. CompositeCommand
 
-History o-- "0..200" Command : undo_stack
-History o-- "0..*" Command : redo_stack
+History *-- "0..200" HistoryEntry : undo_stack
+History *-- "0..*" HistoryEntry : redo_stack
+HistoryEntry *-- "1" Command : cmd
+HistoryEntry *-- "0..1" SelectionChange
+History ..> UndoStep : returns
 CompositeCommand *-- "1..*" Command : children
-CellPatchCommand *-- "1..*" CellChange
+CellPatchCommand *-- "0..*" InkChange
+CellPatchCommand *-- "0..*" FillChange
 CellPatchCommand ..> Project : mutates
 SetFrameBackgroundCommand ..> Project : mutates
 AddFrameCommand ..> Project : mutates
 DeleteFrameCommand ..> Project : mutates
 MoveFrameCommand ..> Project : mutates
 SetPlaybackSettingsCommand ..> Project : mutates
+AddLayerCommand ..> Project : mutates
+DeleteLayerCommand ..> Project : mutates
+MoveLayerCommand ..> Project : mutates
+SetLayerPropsCommand ..> Project : mutates
+ResizeCanvasCommand ..> Project : mutates
 
 note as N1
   Contract
   - apply() is only ever called when the project is in the exact state the command was created against
     (History guarantees this by strict LIFO order), so apply()/revert() never need to validate or fail.
   - apply() followed by revert() restores the project bit-for-bit (except Frame.revision, which only increases).
-  - Commands own all data they need (they never keep references into the project).
-  - Commands never touch Selection, Viewport, Brush or the file on disk.
+  - Commands own all data they need (they never keep references into the project). Frames are addressed by FrameId,
+    layers by LayerId (both stable), never by index; the indices stored in commands are only insert / remove positions.
+  - Commands never touch Selection, Viewport, ToolOptions, the brush library or the file on disk.
+    The few operations that must also move the selection (Move cells, Paste, Import) hand a SelectionChange to the History,
+    which stores it NEXT TO the command and returns it from undo() / redo() (see the rules below).
 end note
 
 note as N2
   Rules
-  - execute(cmd): cmd.apply(project); then record_applied(cmd).
-  - record_applied(cmd): used when the change is already in the project (strokes, typing).
+  - execute(cmd): cmd.apply(project); then record_applied(cmd).   execute_with_selection(cmd, project, sel): the same, then record_applied_with_selection.
+  - record_applied(cmd): used when the change is already in the project (strokes, fills, moves).
       1. redo_stack.clear()  - if clean_marker is Some(m) with m > undo_stack.len(), set clean_marker = None.
-      2. undo_stack.push(cmd)
+      2. undo_stack.push(HistoryEntry{ cmd, selection: None })   (record_applied_with_selection stores Some(sel))
       3. if undo_stack.len() > limit: undo_stack.remove(0); clean_marker = clean_marker.and_then(|m| m.checked_sub(1))
          (a marker that falls off the bottom becomes None = "always dirty").
-  - undo(): pop undo_stack, cmd.revert(project), push onto redo_stack, return Some(cmd.label()). None if empty.
-  - redo(): pop redo_stack, cmd.apply(project), push onto undo_stack, return Some(label). None if empty.
+  - undo(): pop undo_stack, entry.cmd.revert(project), push onto redo_stack, return UndoStep{ label, selection: entry.selection.before }.
+    None if empty.   redo(): pop redo_stack, entry.cmd.apply(project), push onto undo_stack, return UndoStep{ label, selection: entry.selection.after }.
+  - The caller (EditorSession) applies UndoStep.selection with Selection::restore() when it is Some. Entries without a SelectionChange leave the selection alone.
   - mark_clean(): clean_marker = Some(undo_stack.len())   (called right after a successful save of the .aspr).
   - is_dirty(): clean_marker != Some(undo_stack.len())    (a brand-new project starts with clean_marker = Some(0)).
-  - EditorSession::undo()/redo() always dispatches ToolEvent::Cancel to the active tool FIRST, so a running stroke / typing
-    session is committed (or a drag / polygon preview discarded) before the history is touched.
+  - EditorSession::undo()/redo() always dispatches ToolEvent::Cancel to the active tool FIRST, so a running stroke is committed
+    and a running Move drag is rolled back (a drag / polygon preview discarded) before the history is touched.
 end note
 
 note as N3
-  apply : idx = timeline.index_of(frame_id).unwrap(); for ch in changes (in order) frame.set_cell(ch.coord, ch.after);
-          then timeline.select(idx) so the user always SEES what was changed.
-  revert: same loop in REVERSE order writing ch.before; then timeline.select(idx).
-  Used by: Edit text, Clear cells, Paint cells, Fill cells, "Delete selection contents".
+  apply : fidx = timeline.index_of(frame_id).unwrap(); lidx = frame.index_of_layer(layer_id).unwrap();
+          for ch in ink_changes (in order)  frame.set_ink(layer_id, ch.coord, ch.after);
+          for ch in fill_changes (in order) frame.set_fill(layer_id, ch.coord, ch.after);
+          then timeline.select(fidx); frame.select_layer(lidx) so the user always SEES what was changed.
+  revert: same loops in REVERSE order writing ch.before; then timeline.select(fidx); frame.select_layer(lidx).
+  Used by: Paint cells, Erase cells, Fill cells, Move cells, Cut, "Clear selection".
 end note
 
 note as N4
@@ -140,8 +224,8 @@ note as N4
 end note
 
 note as N5
-  blank_after(project, i): frame = Frame::blank(project.alloc_frame_id(), canvas, background of frame i); index = i + 1.
-  duplicate(project, i) : frame = frame[i].duplicate_as(project.alloc_frame_id());  index = i + 1.
+  blank_after(project, i): frame = Frame::blank(project.alloc_frame_id(), canvas, background of frame i) = ONE blank layer "Layer 1"; index = i + 1.
+  duplicate(project, i) : frame = frame[i].duplicate_as(project.alloc_frame_id()) = copy of ALL layers and the background; index = i + 1.
   selected_before = timeline.selected_index() at creation time.
   apply : timeline.insert(index, frame.clone()); timeline.select(index)
   revert: timeline.remove(index); timeline.select(min(selected_before, len - 1))
@@ -151,6 +235,7 @@ note as N6
   new() fails with CannotRemoveLastFrame when timeline.len() == 1 (the Delete button is also disabled then).
   apply : timeline.remove(index); timeline.select(min(index, len - 1))
   revert: timeline.insert(index, frame.clone()); timeline.select(selected_before)
+  The command keeps the whole frame (every layer) so undo restores it completely.
 end note
 
 note as N7
@@ -167,6 +252,33 @@ note as N8
   revert: timeline.fps = before_fps; timeline.looping = before_looping
 end note
 
+note as N9
+  Layer list commands (all address the frame by FrameId and select that frame so the change is visible)
+  AddLayerCommand
+    blank_above(project, frame_id): layer = Layer::blank(frame.alloc_layer_id(), "Layer <id>", canvas); index = active + 1.
+    duplicate(project, frame_id, i): copy of layers[i] with a fresh LayerId, name "<name> copy"; index = i + 1.
+    with_layer(project, frame_id, layer): a ready-made layer (paste, import); index = active + 1; the caller allocated layer.id.
+    All three fail with TooManyLayers when the frame already holds 64 layers.   active_before = frame.active_index().
+    apply : frame.insert_layer(index, layer.clone()); frame.select_layer(index)
+    revert: frame.remove_layer(index); frame.select_layer(min(active_before, len - 1))
+  DeleteLayerCommand  (new() fails with CannotRemoveLastLayer when the frame has one layer; the Delete button is disabled then)
+    apply : frame.remove_layer(index); frame.select_layer(min(index, len - 1))
+    revert: frame.insert_layer(index, layer.clone()); frame.select_layer(active_before)
+  MoveLayerCommand (drag and drop in the Layers panel; from / to are layer indices, bottom = 0, `to` = index after removal)
+    apply : frame.move_layer(from, to); frame.select_layer(to)      revert: frame.move_layer(to, from); frame.select_layer(active_before)
+end note
+
+note as N10
+  SetLayerPropsCommand: rename (Enter / focus loss), eye toggle (one click), opacity slider (on release). new() returns None when nothing differs.
+    apply : frame.set_layer_props(layer_id, after)      revert: frame.set_layer_props(layer_id, before)
+  ResizeCanvasCommand: created by the import flow when the user accepts "Resize project". Grow only (after.cols >= before.cols and after.rows >= before.rows).
+    apply : project.resize_canvas(after)     revert: project.resize_canvas(before)
+    The revert is lossless: History is strictly LIFO, so every command that could have written outside `before` has already been reverted.
+  Import = CompositeCommand("Import file") [ ResizeCanvasCommand (only when the user accepted), AddLayerCommand::with_layer ] executed with
+    execute_with_selection, so ONE Ctrl+Z removes the layer, shrinks the canvas back and restores the selection.
+  Paste = AddLayerCommand::with_layer executed with execute_with_selection.
+  Cut = CellPatchCommand "Cut" (the copy itself is not undoable and not dirty-making).
+end note
 
 ' ---- rule notes: attached to their class, stacked in one column (hidden links) ----
 Command .. N1
@@ -177,6 +289,8 @@ AddFrameCommand .. N5
 DeleteFrameCommand .. N6
 MoveFrameCommand .. N7
 SetPlaybackSettingsCommand .. N8
+AddLayerCommand .. N9
+SetLayerPropsCommand .. N10
 N1 -[hidden]down-> N2
 N2 -[hidden]down-> N3
 N3 -[hidden]down-> N4
@@ -184,4 +298,6 @@ N4 -[hidden]down-> N5
 N5 -[hidden]down-> N6
 N6 -[hidden]down-> N7
 N7 -[hidden]down-> N8
+N8 -[hidden]down-> N9
+N9 -[hidden]down-> N10
 @enduml

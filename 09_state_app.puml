@@ -26,7 +26,7 @@ state Welcome {
 }
 
 state Editor {
-  Editor : entry / viewport.fit(), tool = EditCell, paint = #FFFFFF, erase = transparent, history empty (clean)
+  Editor : entry / viewport.fit(), tool = Paint, brush = '#', planes = {Foreground}, ink = #FFFFFF, fill = #808080, active layer = Layer 1, history empty (clean)
   Editor : exit  / stop playback, drop EditorSession (history, thumbnails, textures)
 }
 
@@ -80,10 +80,12 @@ state Editor {
     state Exporting
     state ErrorShown
     state UnsavedPrompt
+    state BrushEditing
+    state ImportDialog
 
     [*] --> NoModal
 
-    NoModal --> ColorPicking : click paint swatch / erase swatch / frame background swatch\n/ modal = ColorPicker(target, working = current colour)
+    NoModal --> ColorPicking : click char colour swatch / fill colour swatch / frame background swatch\n/ modal = ColorPicker(target, working = current colour, allow_alpha = target is not the frame background)
     ColorPicking --> NoModal : OK / ApplyColor(target, colour, apply_to_all)
     ColorPicking --> NoModal : Cancel or Esc [nothing changes]
 
@@ -91,7 +93,7 @@ state Editor {
     SaveDialog --> NoModal : Cancel or Esc
     SaveDialog --> NoModal : Save [format = .aspr / .png / .ascii / .aanim] and write ok
     SaveDialog --> ErrorShown : Save [write fails]
-    SaveDialog --> Exporting : Save [format = .mp4]\n/ start_mp4()
+    SaveDialog --> Exporting : Save [format = ASCII image sequence or .mp4]\n/ start_ascii_sequence() or start_mp4()
     Exporting --> NoModal : Finished
     Exporting --> NoModal : Cancelled [partial file deleted]
     Exporting --> ErrorShown : Failed
@@ -99,6 +101,17 @@ state Editor {
 
     NoModal --> UnsavedPrompt : close project / window close [dirty]
     UnsavedPrompt --> NoModal : Cancel
+
+    NoModal --> BrushEditing : top bar [New...] / [Edit...]\n/ modal = BrushEditor(new brush or copy / existing brush)
+    BrushEditing --> NoModal : Save [brush valid]\n/ SaveBrush: BrushStore.upsert, brush becomes the active brush
+    BrushEditing --> NoModal : Cancel or Esc
+    BrushEditing --> ErrorShown : Save [brushes.json cannot be written]\n/ the brush stays usable until the app closes
+
+    NoModal --> ImportDialog : File > Import file... [file chosen and decoded]\n/ modal = Import(file, fit)
+    NoModal --> NoModal : File > Import file... [file dialog cancelled]
+    NoModal --> ErrorShown : File > Import file... [file cannot be read or decoded]
+    ImportDialog --> NoModal : Cancel or Esc
+    ImportDialog --> NoModal : Import | Resize project and import | Import without resizing\n/ ApplyImport -> new layer, one undo step
   }
 
   --
@@ -115,8 +128,8 @@ state Editor {
 note bottom of Editor
   Rules
   - While the Modal region is not NoModal the rest of the UI ignores input (dimmed layer) and playback is stopped.
-  - Esc closes ColorPicking / SaveDialog / UnsavedPrompt as Cancel. Esc does NOT close Exporting (use the Cancel button) or ErrorShown (use OK).
-  - The Playback region is detailed in diagram 11a.
+  - Esc closes ColorPicking / SaveDialog / UnsavedPrompt / BrushEditing / ImportDialog as Cancel. Esc does NOT close Exporting (use the Cancel button) or ErrorShown (use OK).
+  - The Playback region is detailed in diagram 11a. The import dialog's own phases are in diagram 11d.
 end note
 
 @enduml

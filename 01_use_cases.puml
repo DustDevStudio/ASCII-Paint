@@ -4,7 +4,7 @@ left to right direction
 title Use cases - AsciiPaint
 
 actor "User" as U
-actor "File system" as FS <<system>>
+actor "File system" as FS <<s>>
 actor "ffmpeg" as FF <<external program>>
 
 rectangle "AsciiPaint" {
@@ -13,33 +13,68 @@ rectangle "AsciiPaint" {
     usecase "Create new project" as UC_New
     usecase "Open recent project" as UC_Recent
     usecase "Close project" as UC_Close
-    usecase "Save project (.aspr)" as UC_SaveProj
-    usecase "Export current frame\n(.png / .ascii)" as UC_ExpFrame
-    usecase "Export animation\n(.aanim / .mp4)" as UC_ExpAnim
+    usecase "Save project (.aspr)\nwith all layers" as UC_SaveProj
+    usecase "Export current frame\n(.png / .ascii, flattened)" as UC_ExpFrame
+    usecase "Export animation\n(.aanim / ASCII image sequence / .mp4)" as UC_ExpAnim
     usecase "Choose project settings\n(name, folder, background, fps)" as UC_Settings
     usecase "Choose file name and location" as UC_Where
-    usecase "Render frames to pixels" as UC_Render
+    usecase "Flatten layers and render frames" as UC_Render
   }
 
-  package "Canvas editing" {
-    usecase "Edit cell (type characters)" as UC_Edit
-    usecase "Clear cell" as UC_Clear
-    usecase "Paint cell" as UC_Paint
-    usecase "Fill cell" as UC_Fill
-    usecase "Square select cells" as UC_Rect
-    usecase "Polygon select cells" as UC_Poly
-    usecase "Ellipse select cells" as UC_Ell
+  package "Import" {
+    usecase "Import file\n(.txt / .ascii)" as UC_Import
+    usecase "Choose file to import" as UC_ImpFile
+    usecase "Suggest growing the project" as UC_Suggest
+    usecase "Grow project canvas" as UC_Grow
+  }
+
+  package "Painting" {
+    usecase "Paint with brush" as UC_Paint
+    usecase "Erase" as UC_Erase
+    usecase "Fill\n(foreground / background plane)" as UC_Fill
+    usecase "Pick colour from the canvas" as UC_PickCanvas
+    usecase "Choose planes to edit\n(foreground / background)" as UC_Planes
     usecase "Constrain edits to selection" as UC_Constrain
     usecase "Clear selection contents" as UC_ClearSel
     usecase "Undo / redo" as UC_Undo
   }
 
+  package "Brushes" {
+    usecase "Choose brush" as UC_BrushPick
+    usecase "Create brush" as UC_BrushNew
+    usecase "Edit brush" as UC_BrushEdit
+    usecase "Delete brush" as UC_BrushDel
+  }
+
+  package "Selection" {
+    usecase "Square select cells" as UC_Rect
+    usecase "Polygon select cells" as UC_Poly
+    usecase "Ellipse select cells" as UC_Ell
+    usecase "Invert selection" as UC_Invert
+    usecase "Move selection\n(contents or outline only)" as UC_Move
+    usecase "Copy selection\n(active layer / merged)" as UC_Copy
+    usecase "Cut selection" as UC_Cut
+    usecase "Paste as new layer" as UC_Paste
+  }
+
+  package "Layers" {
+    usecase "Add layer" as UC_LAdd
+    usecase "Duplicate layer" as UC_LDup
+    usecase "Delete layer" as UC_LDel
+    usecase "Reorder layers" as UC_LMove
+    usecase "Select active layer" as UC_LSel
+    usecase "Rename layer" as UC_LName
+    usecase "Show / hide layer" as UC_LVis
+    usecase "Set layer opacity" as UC_LOpa
+    usecase "Create layer with content" as UC_LNew
+  }
+
   package "Colours" {
-    usecase "Choose paint colour" as UC_PaintCol
-    usecase "Choose erase colour" as UC_EraseCol
+    usecase "Choose character colour" as UC_InkCol
+    usecase "Choose background fill colour" as UC_FillCol
     usecase "Edit frame background colour" as UC_Bg
     usecase "Apply background to all frames" as UC_BgAll
-    usecase "Pick a colour" as UC_Pick
+    usecase "Edit a colour (dialog)" as UC_Pick
   }
 
   package "View" {
@@ -52,7 +87,7 @@ rectangle "AsciiPaint" {
     usecase "Add frame" as UC_Add
     usecase "Duplicate frame" as UC_Dup
     usecase "Delete frame" as UC_Del
-    usecase "Reorder frames" as UC_Move
+    usecase "Reorder frames" as UC_FMove
     usecase "Select frame" as UC_Sel
     usecase "Set FPS / loop" as UC_Fps
     usecase "Play / pause animation" as UC_Play
@@ -65,17 +100,36 @@ U --> UC_Close
 U --> UC_SaveProj
 U --> UC_ExpFrame
 U --> UC_ExpAnim
-U --> UC_Edit
-U --> UC_Clear
+U --> UC_Import
 U --> UC_Paint
+U --> UC_Erase
 U --> UC_Fill
+U --> UC_PickCanvas
+U --> UC_Planes
+U --> UC_ClearSel
+U --> UC_Undo
+U --> UC_BrushPick
+U --> UC_BrushNew
+U --> UC_BrushEdit
+U --> UC_BrushDel
 U --> UC_Rect
 U --> UC_Poly
 U --> UC_Ell
-U --> UC_ClearSel
-U --> UC_Undo
-U --> UC_PaintCol
-U --> UC_EraseCol
+U --> UC_Invert
+U --> UC_Move
+U --> UC_Copy
+U --> UC_Cut
+U --> UC_Paste
+U --> UC_LAdd
+U --> UC_LDup
+U --> UC_LDel
+U --> UC_LMove
+U --> UC_LSel
+U --> UC_LName
+U --> UC_LVis
+U --> UC_LOpa
+U --> UC_InkCol
+U --> UC_FillCol
 U --> UC_Bg
 U --> UC_Zoom
 U --> UC_Pan
@@ -83,7 +137,7 @@ U --> UC_Grid
 U --> UC_Add
 U --> UC_Dup
 U --> UC_Del
-U --> UC_Move
+U --> UC_FMove
 U --> UC_Sel
 U --> UC_Fps
 U --> UC_Play
@@ -94,15 +148,28 @@ UC_ExpFrame ..> UC_Where : <<include>>
 UC_ExpAnim ..> UC_Where : <<include>>
 UC_ExpFrame ..> UC_Render : <<include>>
 UC_ExpAnim ..> UC_Render : <<include>>
-UC_PaintCol ..> UC_Pick : <<include>>
-UC_EraseCol ..> UC_Pick : <<include>>
+UC_Import ..> UC_ImpFile : <<include>>
+UC_Import ..> UC_LNew : <<include>>
+UC_Paste ..> UC_LNew : <<include>>
+UC_Cut ..> UC_Copy : <<include>>
+UC_Cut ..> UC_ClearSel : <<include>>
+UC_Suggest .> UC_Import : <<extend>>
+UC_Grow .> UC_Suggest : <<extend>>
+UC_Paint ..> UC_BrushPick : <<include>>
+UC_Fill ..> UC_BrushPick : <<include>>
+UC_Paint ..> UC_Planes : <<include>>
+UC_Erase ..> UC_Planes : <<include>>
+UC_Fill ..> UC_Planes : <<include>>
+UC_PickCanvas ..> UC_Planes : <<include>>
+UC_InkCol ..> UC_Pick : <<include>>
+UC_FillCol ..> UC_Pick : <<include>>
 UC_Bg ..> UC_Pick : <<include>>
 UC_Settings ..> UC_Pick : <<include>>
 UC_BgAll .> UC_Bg : <<extend>>
-UC_Constrain .> UC_Edit : <<extend>>
-UC_Constrain .> UC_Clear : <<extend>>
 UC_Constrain .> UC_Paint : <<extend>>
+UC_Constrain .> UC_Erase : <<extend>>
 UC_Constrain .> UC_Fill : <<extend>>
+UC_Constrain .> UC_ClearSel : <<extend>>
 UC_SaveProj .> UC_Close : <<extend>>
 
 UC_New --> FS
@@ -111,11 +178,15 @@ UC_SaveProj --> FS
 UC_ExpFrame --> FS
 UC_ExpAnim --> FS
 UC_ExpAnim --> FF : .mp4 only
+UC_Import --> FS
+UC_BrushNew --> FS : brushes.json
+UC_BrushEdit --> FS : brushes.json
+UC_BrushDel --> FS : brushes.json
 
 note bottom of UC_Constrain
   Extension point: "a selection exists".
-  When it does, every editing tool only affects cells inside the selection.
-  Without a selection the whole page is editable.
+  When it does, Paint, Erase, Fill and Clear selection contents only affect cells inside the selection.
+  Without a selection the whole page is editable. Invert selection flips what is inside.
 end note
 
 note bottom of UC_Close
@@ -124,13 +195,46 @@ note bottom of UC_Close
 end note
 
 note bottom of UC_Bg
-  Each frame owns its own background colour.
+  Each frame owns its own background colour: the opaque page colour UNDER the whole layer stack.
   New frames copy the background of the selected frame; duplicated frames copy their source.
-  Cells with no background of their own (transparent) show this colour; exports use it too.
+  Cells whose mixed background is transparent show this colour; exports use it too.
 end note
 
 note bottom of UC_Rect
   The three selection use cases (square, polygon, ellipse) create the selection that activates the
-  "Constrain edits to selection" extension. Modifier keys while selecting: Shift = add, Alt = subtract.
+  "Constrain edits to selection" extension. Replace / Add / Subtract buttons in the top bar, or Shift = add, Alt = subtract while selecting.
+end note
+
+note bottom of UC_Paint
+  There is no typing on the canvas. The character comes from the chosen brush (a stamp of one or more characters),
+  the colours from the top bar. The planes switch decides what is written: Foreground = character + character colour,
+  Background = cell fill colour (both colours may have transparency). Custom brushes are created in the Brush editor.
+end note
+
+note bottom of UC_Move
+  Needs a selection. "Contents" lifts the selected cells of the ACTIVE layer and drops them somewhere else (undoable, the selection moves along).
+  "Outline only" moves just the selection marks. Arrow keys nudge by one cell.
+end note
+
+note bottom of UC_Paste
+  Paste always creates a NEW layer above the active one that holds only the copied selection, at its original position,
+  selected and ready to be dragged with Move. Copy takes the active layer; "Copy merged" takes what is visible.
+end note
+
+note bottom of UC_Import
+  .txt: every line is a row, every character a cell (spaces stay empty), drawn in the chosen character colour.
+  .ascii: the flattened image with its own colours. The result is added as a new layer above the active one.
+  "Suggest growing the project" extends Import at the extension point "file is wider or taller than the project": the user may accept
+  (project grows, then import) or refuse (the file is simply added as a layer and cut off at the page border).
+end note
+
+note bottom of UC_PickCanvas
+  Picks the colour of the clicked cell for the plane(s) switched on: Foreground -> character colour, Background -> background fill colour.
+  Source = merged result (default) or the active layer only.
+end note
+
+note bottom of UC_LNew
+  Shared step of Paste and Import: build a full-page layer from a snippet, insert it above the active layer, make it active,
+  select its cells. One undo step.
 end note
 @enduml

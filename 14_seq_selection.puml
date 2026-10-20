@@ -11,10 +11,10 @@ participant "ShapeRasterizer" as SR
 participant "Selection" as Sel
 participant "CanvasRenderer" as R
 
-User -> CV : primary button down at cell a  (Shift held = Add, Alt held = Subtract, none = Replace)
+User -> CV : primary button down at cell a  (Shift held = Add, Alt held = Subtract, otherwise the Replace / Add / Subtract button of the top bar)
 CV -> TR : dispatch(PointerDown(a, mods))
 TR -> T : on_event(PointerDown(a, mods))
-T -> T : drag = DragState{ anchor: a, current: a, mode: mods.selection_mode() }
+T -> T : drag = DragState{ anchor: a, current: a, mode: options.mode_for(mods) }
 
 loop pointer moves while the button is held
   User -> CV : move
@@ -64,10 +64,10 @@ participant "SelectPolygonTool" as T
 participant "ShapeRasterizer" as SR
 participant "Selection" as Sel
 
-User -> CV : click cell v1  (Shift = Add, Alt = Subtract, none = Replace)
+User -> CV : click cell v1  (Shift = Add, Alt = Subtract, otherwise the top bar mode)
 CV -> TR : dispatch(PointerDown(v1, mods))
 TR -> T : on_event(PointerDown(v1, mods))
-T -> T : vertices = [v1]; mode = mods.selection_mode()
+T -> T : vertices = [v1]; mode = options.mode_for(mods)
 
 loop add vertices
   User -> CV : move pointer
@@ -140,21 +140,175 @@ else busy (Esc goes to the tool as Cancel instead)
   E -> TR : dispatch(Cancel)
 end
 
-User -> E : Delete  [no EditCell session active]
-E -> S : delete_selection_contents()
+User -> E : Ctrl+Shift+I  (Select > Invert, also the [Invert] button in the top bar)
+E -> S : invert_selection()
 alt selection.is_empty()
+  S --> E : nothing happens   (menu item / button disabled)
+else
+  S -> Sel : invert()   (complement inside the page; an empty result = no selection = whole page editable)
+end
+
+User -> E : Delete  (Edit > Clear selection contents)
+E -> S : delete_selection_contents()
+alt selection.is_empty() or the active layer is hidden
   S --> E : nothing happens
 else
-  S -> PB : new(selected frame id)
+  S -> PB : new(selected frame id, active layer id)
   loop for each selected cell k (row-major order)
-    S -> PB : write(project, k, ClearOperation.apply(old, brush))   (glyph ' ', fg WHITE, bg = brush.erase)
+    S -> PB : clear(project, [k])   (glyph removed AND fill removed: InkCell::EMPTY + Rgba::TRANSPARENT)
   end
   S -> PB : finish("Clear selection")
   PB --> S : Option<CellPatchCommand>
   S -> H : record_applied(cmd)   (when Some)
 end
 note over E, H
-  When the EditCell tool has a cursor, Delete is delivered to the tool (clears ONE glyph) instead.
-  The selection mask itself stays unchanged after "Clear selection".
+  Delete clears BOTH planes of the ACTIVE layer only. The selection mask itself stays unchanged.
+  Select all / deselect / invert are not recorded in the history (only Move cells and Paste restore the selection on undo, see 14d and 14e).
 end note
+@enduml
+
+@startuml 14d_seq_move_selection
+!include _style.puml
+title Sequence - Move the selection (Move tool, contents or outline only)
+autonumber
+
+actor User
+participant "CanvasView" as CV
+participant "ToolRegistry" as TR
+participant "MoveTool" as MT
+participant "Selection" as Sel
+participant "CellBuffer" as CB
+participant "PatchBuilder" as PB
+participant "Frame / active Layer\n(selected frame)" as F
+participant "CanvasRenderer" as R
+participant "History" as H
+
+User -> CV : primary button down at cell c  (needs a selection, c inside it)
+CV -> TR : dispatch(PointerDown(c, mods))
+TR -> MT : on_event(PointerDown(c))
+alt selection is empty or c is not selected
+  MT --> TR : Consumed   (ignored)
+else move_mode = Contents
+  MT -> F : active layer visible?   (hidden: Consumed, nothing happens)
+  MT -> Sel : clone()   -> selection_before
+  MT -> CB : extract(active layer, selection)   -> floating (both planes of the selected cells)
+  MT -> PB : new(frame_id, layer_id); clear(project, selected cells)
+  PB -> F : set_ink(EMPTY) / set_fill(TRANSPARENT)   (a hole appears in the layer at once)
+else move_mode = OutlineOnly
+  MT -> MT : drag = {anchor: c, offset: (0, 0)}   (no buffer, no builder)
+end
+
+loop pointer moves while the button is held
+  User -> CV : move
+  CV -> TR : dispatch(PointerMove(cell))
+  TR -> MT : on_event(PointerMove(cell))
+  MT -> Sel : bounds()
+  MT -> MT : offset = (cell - anchor) clamped so that the shifted bounds stay inside the page
+  CV -> MT : overlay(view)
+  MT --> CV : MovePreview{ floating, offset }
+  CV -> R : paint(...) draws the floating cells at their offset and the shifted selection outline
+end
+
+alt User releases the button
+  User -> CV : primary button up
+  CV -> TR : dispatch(PointerUp(cell))
+  TR -> MT : on_event(PointerUp)
+  alt offset == (0, 0)
+    MT -> PB : rollback(project)   (Contents: the hole is filled again, nothing recorded)
+  else Contents
+    MT -> PB : blit(project, floating, offset)   (only cells that hold something overwrite the destination)
+    MT -> Sel : translate(offset.x, offset.y)
+    MT -> PB : finish("Move cells")
+    PB --> MT : Some(CellPatchCommand)
+    MT -> H : record_applied_with_selection(cmd, SelectionChange{ before: selection_before, after: selection.clone() })
+  else OutlineOnly
+    MT -> Sel : translate(offset.x, offset.y)   (not recorded, selection changes are not undoable)
+  end
+else User presses Escape while dragging
+  User -> CV : Escape
+  CV -> TR : dispatch(Key(Escape))
+  TR -> MT : on_event(Key(Escape))
+  MT -> PB : rollback(project)   (Contents only)
+  MT -> MT : drag = None   (selection unchanged)
+end
+
+== keyboard nudge ==
+User -> CV : Arrow key (Shift = 10 cells) with the Move tool active and a non-empty selection
+CV -> TR : dispatch(Key(Arrow*, mods))
+TR -> MT : on_event(...)
+MT -> MT : runs the same lift / blit / translate sequence as one click-drag with offset = delta (clamped); ONE undo step per key press
+
+== undo ==
+User -> H : Ctrl+Z
+H --> User : UndoStep{ label: "Move cells", selection: Some(selection_before) }
+note over H
+  EditorSession restores the selection with Selection::restore(), so the marching ants jump back together with the cells.
+  Redo restores selection_after the same way.
+end note
+@enduml
+
+@startuml 14e_seq_copy_cut_paste
+!include _style.puml
+title Sequence - Copy, Cut and Paste as a new layer
+autonumber
+
+actor User
+participant "EditorScreen" as E
+participant "EditorSession" as S
+participant "Selection" as Sel
+participant "CellBuffer" as CB
+participant "Compositor" as Comp
+participant "Clipboard" as CL
+participant "PatchBuilder" as PB
+participant "Frame" as F
+participant "Command\n(AddLayerCommand)" as C
+participant "History" as H
+participant "ToolRegistry" as TR
+
+== Copy (Ctrl+C) / Copy merged (Ctrl+Shift+C) ==
+User -> E : Ctrl+C  (or Ctrl+Shift+C)
+E -> S : copy(merged)
+alt selection is empty
+  S --> E : nothing happens   (menu items disabled)
+else merged = false
+  S -> CB : extract(active layer, selection)   (both planes of the selected cells, cells outside the selection stay empty)
+else merged = true
+  S -> Comp : flatten(selected frame)
+  Comp --> S : FlatFrame
+  S -> CB : extract_flat(flat, selection)   (what is VISIBLE: glyph and mixed colours, no frame background)
+end
+S -> CL : set(buffer)
+note right of CL : not undoable, not dirty-making. The clipboard lives in the app (Services), so it survives closing a project.
+
+== Cut (Ctrl+X) ==
+User -> E : Ctrl+X
+E -> S : cut()
+S -> S : copy(false)
+S -> PB : new(frame_id, active layer id); clear(project, selected cells)
+S -> PB : finish("Cut")
+PB --> S : Option<CellPatchCommand>
+S -> H : record_applied(cmd)   (when Some)
+
+== Paste (Ctrl+V) ==
+User -> E : Ctrl+V
+E -> S : paste()
+alt clipboard is empty
+  S --> E : nothing happens   (menu item disabled)
+else frame already has 64 layers
+  S --> E : status bar "Layer limit (64) reached", nothing happens
+else
+  S -> CL : get()
+  CL --> S : CellBuffer
+  S -> F : alloc_layer_id()
+  S -> CB : into_layer(id, "Pasted selection", canvas)   (full-page layer, content at the ORIGINAL position, only the copied cells)
+  S -> Sel : clone()   -> before
+  S -> C : AddLayerCommand::with_layer(project, frame_id, layer)   (index = active + 1)
+  S -> Sel : apply(buffer.selected_cells((0, 0), canvas), Replace)   -> after = clone()
+  S -> H : execute_with_selection(cmd, project, SelectionChange{ before, after })
+  H -> C : apply(project)
+  C -> F : insert_layer(index, layer); select_layer(index)
+  S -> S : options.move_mode = Contents; set_tool(Move)
+  S -> TR : switch_to(Move)
+  note right of S : the new layer is active and its cells are selected, so one drag with the Move tool puts it where the user wants it.
+end
 @enduml

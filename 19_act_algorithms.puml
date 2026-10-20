@@ -1,10 +1,11 @@
 @startuml 19a_act_flood_fill
 !include _style.puml
-title Activity - FloodFill::region(grid, seed, channel, limit)  (4-connected scanline fill, no recursion)
+title Activity - FloodFill::region(layer, seed, plane, limit)  (4-connected scanline fill on ONE plane of ONE layer, no recursion)
 
 start
-:value(c) := channel == Foreground ? Fg(grid[c].fg) : Bg(grid[c].bg)
-(a comparable ChannelValue, Bg(None) != Bg(Some(x)));
+:value(c) := layer.value(plane, c)
+(a comparable PlaneValue: Ink(InkCell{glyph, colour}) for the Foreground plane, Fill(Rgba) for the Background plane,
+empty cells always compare equal because every stored value is normalised);
 :target := value(seed);
 :visited := bitset(cols * rows) all false;
 :result := empty Vec<CellCoord>;
@@ -33,8 +34,10 @@ stop
 
 note right
   Complexity O(cells): every cell is marked visited once. Max 17 280 cells for the default page.
-  The caller guarantees the seed is permitted by `limit` and that the seed does not already hold the paint colour
+  The caller guarantees the seed is permitted by `limit` and that the seed does not already hold the target value of that plane
   (otherwise the region would be re-painted with the same value and the tool records nothing).
+  Only the chosen plane of the given layer is looked at: the foreground region is bounded by glyph / character-colour differences, the background
+  region by fill-colour differences, and other layers never matter. The Fill tool calls this once per plane switched on, so the two fills are independent.
 end note
 @enduml
 

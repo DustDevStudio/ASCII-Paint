@@ -1,10 +1,13 @@
 @startuml 03_class_domain
 !include _style.puml
-title Domain model - crate ascii_core::model (pure data, no UI / IO dependencies)
+title Domain model - crate ascii_core::{model, compose} (pure data, no UI / IO dependencies)
 
 legend top right
   Notation: + pub, - private. <<struct>>, <<enum>>, <<trait>> are Rust kinds.
-  Types use Rust syntax. "persisted" = written to .aspr / .ascii / .aanim.
+  Types use Rust syntax. "persisted" = written to .aspr (layers) / .ascii and .aanim (flattened).
+  Vocabulary: every Layer owns TWO hidden planes - the FOREGROUND plane (Layer.ink: glyph + colour per cell)
+  and the BACKGROUND plane (Layer.fill: colour per cell). The user sees one layer; the engine keeps two.
+  Frame.background is the opaque page colour underneath the whole layer stack.
 end legend
 
 package "ascii_core::model" {
@@ -17,7 +20,24 @@ package "ascii_core::model" {
     + {static} WHITE: Rgb
     + {static} from_hex(s: &str) -> Result<Rgb, ColorParseError>
     + to_hex() -> String
-    + to_rgba(alpha: u8) -> [u8; 4]
+  }
+
+  class Rgba <<struct, Copy, Eq, Hash>> {
+    + r: u8
+    + g: u8
+    + b: u8
+    + a: u8
+    + {static} TRANSPARENT: Rgba
+    + {static} BLACK: Rgba
+    + {static} WHITE: Rgba
+    + {static} opaque(c: Rgb) -> Rgba
+    + {static} from_hex(s: &str) -> Result<Rgba, ColorParseError>
+    + to_hex() -> String
+    + rgb() -> Rgb
+    + is_transparent() -> bool
+    + normalized() -> Rgba
+    + scaled_alpha(opacity: u8) -> Rgba
+    + over(below: Rgba) -> Rgba
   }
 
   class CellCoord <<struct, Copy, Eq, Hash, Ord>> {
@@ -44,7 +64,10 @@ package "ascii_core::model" {
     + {static} DEFAULT_ROWS: u16 = 72
     + {static} DEFAULT_CELL_W: u8 = 8
     + {static} DEFAULT_CELL_H: u8 = 15
+    + {static} MAX_DIM: u16 = 1024
     + {static} default() -> CanvasSpec
+    + with_size(cols: u16, rows: u16) -> Result<CanvasSpec, DomainError>
+    + fit_content(w: u32, h: u32) -> ImportFit
     + pixel_width() -> u32
     + pixel_height() -> u32
     + cell_count() -> usize
@@ -52,25 +75,73 @@ package "ascii_core::model" {
     + clamp(col: i32, row: i32) -> CellCoord
   }
 
-  class Cell <<struct, Copy, Eq>> {
-    + glyph: char
-    + fg: Rgb
-    + bg: Option<Rgb>
-    + {static} EMPTY: Cell
-    + is_blank() -> bool
+  enum ImportFit <<enum>> {
+    Fits
+    TooBig(suggested: CanvasSpec, cut_if_kept: (u32, u32), cut_if_resized: (u32, u32))
   }
 
-  class Grid <<struct, Clone>> {
+  class InkCell <<struct, Copy, Eq>> {
+    + glyph: char
+    + color: Rgba
+    + {static} EMPTY: InkCell
+    + is_empty() -> bool
+    + normalized() -> InkCell
+  }
+
+  enum Plane <<enum, Copy>> {
+    Foreground
+    Background
+  }
+
+  class PlaneSet <<struct, Copy, Eq>> {
+    + foreground: bool
+    + background: bool
+    + contains(p: Plane) -> bool
+    + is_empty() -> bool
+    + iter() -> impl Iterator<Item = Plane>
+  }
+
+  enum PlaneValue <<enum, Copy, Eq>> {
+    Ink(InkCell)
+    Fill(Rgba)
+  }
+
+  class "Grid<T>" as Grid <<struct, Clone>> {
     - cols: u16
     - rows: u16
-    - cells: Vec<Cell>
-    + {static} blank(spec: &CanvasSpec) -> Grid
+    - cells: Vec<T>
+    + {static} filled(spec: &CanvasSpec, value: T) -> Grid<T>
     + cols() -> u16
     + rows() -> u16
-    + get(c: CellCoord) -> Option< &Cell>
-    + set(c: CellCoord, cell: Cell) -> Option<Cell>
-    + iter() -> impl Iterator<Item = (CellCoord, &Cell)>
+    + get(c: CellCoord) -> Option< &T>
+    + set(c: CellCoord, value: T) -> Option<T>
+    + iter() -> impl Iterator<Item = (CellCoord, &T)>
+    + resized(cols: u16, rows: u16, pad: T) -> Grid<T>
     - index(c: CellCoord) -> usize
+  }
+
+  class LayerId <<struct, Copy, Eq, Hash>> {
+    + 0: u32
+  }
+
+  class LayerProps <<struct, Clone, Eq>> {
+    + name: String
+    + visible: bool
+    + opacity: u8
+  }
+
+  class Layer <<struct, Clone>> {
+    + id: LayerId
+    + name: String
+    + visible: bool
+    + opacity: u8
+    + ink: Grid<InkCell>
+    + fill: Grid<Rgba>
+    + {static} blank(id: LayerId, name: String, spec: &CanvasSpec) -> Layer
+    + props() -> LayerProps
+    + value(plane: Plane, c: CellCoord) -> Option<PlaneValue>
+    + is_blank() -> bool
+    + resized(cols: u16, rows: u16) -> Layer
   }
 
   class FrameId <<struct, Copy, Eq, Hash>> {
@@ -80,12 +151,28 @@ package "ascii_core::model" {
   class Frame <<struct, Clone>> {
     + id: FrameId
     + background: Rgb
-    + grid: Grid
+    - layers: Vec<Layer>
+    - active: usize
+    - next_layer_id: u32
     - revision: u64
+    + {static} MAX_LAYERS: usize = 64
     + {static} blank(id: FrameId, spec: &CanvasSpec, background: Rgb) -> Frame
     + duplicate_as(new_id: FrameId) -> Frame
-    + set_cell(c: CellCoord, cell: Cell) -> Option<Cell>
+    + layers() -> &[Layer]
+    + layer(i: usize) -> Option< &Layer>
+    + index_of_layer(id: LayerId) -> Option<usize>
+    + active_index() -> usize
+    + active_layer() -> &Layer
+    + select_layer(i: usize) -> Result<(), DomainError>
+    + alloc_layer_id() -> LayerId
+    + insert_layer(i: usize, l: Layer) -> Result<(), DomainError>
+    + remove_layer(i: usize) -> Result<Layer, DomainError>
+    + move_layer(from: usize, to: usize) -> Result<(), DomainError>
+    + set_ink(layer: LayerId, c: CellCoord, v: InkCell) -> Option<InkCell>
+    + set_fill(layer: LayerId, c: CellCoord, v: Rgba) -> Option<Rgba>
+    + set_layer_props(layer: LayerId, p: LayerProps) -> Option<LayerProps>
     + set_background(bg: Rgb) -> Rgb
+    + resize_canvas(cols: u16, rows: u16)
     + revision() -> u64
     - touch()
   }
@@ -132,15 +219,56 @@ package "ascii_core::model" {
     - next_frame_id: u64
     + {static} new(name: String, background: Rgb, fps: Fps, now: i64) -> Project
     + alloc_frame_id() -> FrameId
+    + resize_canvas(new: CanvasSpec) -> CanvasSpec
     + touch_modified(now: i64)
+  }
+
+  class CellBuffer <<struct, Clone>> {
+    + origin: CellCoord
+    + width: u16
+    + height: u16
+    - ink: Vec<InkCell>
+    - fill: Vec<Rgba>
+    - mask: Vec<bool>
+    + {static} extract(layer: &Layer, sel: &Selection) -> CellBuffer
+    + {static} extract_flat(flat: &FlatFrame, sel: &Selection) -> CellBuffer
+    + {static} from_parts(origin: CellCoord, width: u16, height: u16, ink: Vec<InkCell>, fill: Vec<Rgba>) -> CellBuffer
+    + cells() -> impl Iterator<Item = (CellCoord, &InkCell, &Rgba)>
+    + is_blank() -> bool
+    + selected_cells(offset: (i32, i32), spec: &CanvasSpec) -> Vec<CellCoord>
+    + into_layer(id: LayerId, name: String, spec: &CanvasSpec) -> Layer
   }
 
   enum DomainError <<enum>> {
     IndexOutOfRange
     CannotRemoveLastFrame
+    CannotRemoveLastLayer
+    TooManyLayers
     InvalidFps
     InvalidCanvas
     InvalidName
+    InvalidOpacity
+  }
+}
+
+package "ascii_core::compose" {
+
+  class FlatCell <<struct, Copy, Eq>> {
+    + glyph: char
+    + ink: Rgba
+    + fill: Rgba
+    + {static} EMPTY: FlatCell
+  }
+
+  class FlatFrame <<struct, Clone>> {
+    + background: Rgb
+    + grid: Grid<FlatCell>
+    + page_color(c: CellCoord) -> Rgb
+  }
+
+  class Compositor <<utility, no state>> {
+    + {static} flatten(frame: &Frame, canvas: &CanvasSpec) -> FlatFrame
+    + {static} flatten_cell(frame: &Frame, c: CellCoord) -> FlatCell
   }
 }
 
@@ -148,30 +276,59 @@ Project *-- "1" ProjectMeta
 Project *-- "1" CanvasSpec
 Project *-- "1" Timeline
 Timeline *-- "1..*  (ordered)" Frame : frames
-Frame *-- "1" Grid
+Frame *-- "1..64  (bottom to top)" Layer : layers
 Frame *-- "1" Rgb : background
 Frame *-- "1" FrameId
+Layer *-- "1" LayerId
+Layer *-- "1" Grid : ink = foreground plane
+Layer *-- "1" Grid : fill = background plane
+Layer ..> LayerProps : props()
+Layer ..> PlaneValue : value()
+Layer ..> Plane
+Grid *-- "cols x rows" InkCell : row-major (ink)
+Grid *-- "cols x rows" Rgba : row-major (fill)
+InkCell *-- "1" Rgba : color
+PlaneValue ..> InkCell
+PlaneValue ..> Rgba
+PlaneSet ..> Plane
 Timeline *-- "1" Fps
-Grid *-- "cols x rows" Cell : row-major
-Cell *-- "1" Rgb : fg
-Cell o-- "0..1" Rgb : bg
 CellRect ..> CellCoord
 Grid ..> CellCoord : addressed by
+CanvasSpec ..> ImportFit : fit_content()
+CellBuffer *-- "w x h" InkCell
+CellBuffer *-- "w x h" Rgba
+CellBuffer ..> Layer : extract() / into_layer()
 Project ..> DomainError : <<throws>>
+Compositor ..> Frame : reads
+Compositor ..> FlatFrame : returns
+FlatFrame *-- "1" Grid : grid of FlatCell
+FlatFrame *-- "1" Rgb : background
+Grid *-- "cols x rows" FlatCell : row-major (flat)
+FlatCell *-- "2" Rgba : ink, fill
 
-note right of Rgb
-  Colors carry NO alpha anywhere in the model.
-  "Transparent" is expressed only by Option::None on Cell.bg.
+note right of Rgba
+  Colours of cells carry alpha (0 = fully transparent, 255 = opaque). Straight (non-premultiplied) storage.
+  - normalized(): any colour with a == 0 becomes TRANSPARENT = (0, 0, 0, 0), so two transparent cells always compare equal.
+    Every write into a plane normalises first.
+  - scaled_alpha(k) = same rgb, a' = div255(a * k)            where div255(x) = (x + 127) / 255   (integer maths)
+  - self.over(below) ("source over destination"), all integer:
+      out_a = a_s + div255(a_d * (255 - a_s))
+      out_a == 0  ->  TRANSPARENT
+      out_c = (c_s * a_s * 255 + c_d * a_d * (255 - a_s) + out_a * 255 / 2) / (out_a * 255)   for each of r, g, b
+  - Test values: (255,0,0,128).over((0,0,255,255)) = (128,0,127,255)
+                 (255,0,0,128).over((0,255,0,128)) = (170,85,0,192)
+                 x.over(TRANSPARENT) = x            (10,20,30,200).over(TRANSPARENT) = (10,20,30,200)
+  - Rgb (no alpha) is used only where the colour is always opaque: Frame.background and the Rgb part of file headers.
 end note
 
-note right of Cell
-  Semantics
-  - glyph: any Unicode scalar. ' ' (space) = blank glyph.
-  - fg: colour of the glyph pixels. Default Rgb::WHITE.
-  - bg: Some(c) = cell is filled with c.
-        None   = cell is transparent, the FRAME BACKGROUND shows through.
-  - Cell::EMPTY = { glyph: ' ', fg: WHITE, bg: None }
-  - is_blank() = glyph == ' ' && bg.is_none()
+note right of InkCell
+  Foreground plane cell.
+  - glyph: any Unicode scalar. ' ' (space) = no character at all (the cell has no ink).
+  - color: colour (with alpha) of the glyph pixels. Meaningless while glyph == ' '.
+  - EMPTY = { glyph: ' ', color: TRANSPARENT }.
+  - normalized(): glyph == ' '  ->  EMPTY,  otherwise color.normalized().  Every write into the plane normalises first,
+    so "empty" has exactly one representation (needed by flood fill equality and by the "nothing changed" checks).
+  Background plane cell = a plain Rgba (alpha 0 = nothing, the layers below / the frame background show through).
 end note
 
 note bottom of Grid
@@ -179,18 +336,38 @@ note bottom of Grid
   - cells.len() == cols as usize * rows as usize
   - index(c) = c.row as usize * cols as usize + c.col as usize
   - get() returns None when c is out of bounds. set() returns None and does nothing when out of bounds,
-    otherwise returns the previous Cell (used by commands to record "before").
-  - All frames of a project share the same cols/rows (= Project.canvas).
+    otherwise returns the previous value (used by commands to record "before").
+  - resized(cols, rows, pad): new grid, old cells copied to the same (col,row), new cells = pad (top-left anchored).
+  - Used as Grid<InkCell> (foreground plane), Grid<Rgba> (background plane) and Grid<FlatCell> (compositor output).
+  - All grids of all layers of all frames of a project have the same cols/rows (= Project.canvas).
+end note
+
+note bottom of Layer
+  Layer semantics
+  - A layer is a full-page pair of planes: ink (foreground) and fill (background). They are edited independently
+    (Paint / Erase / Fill choose the plane(s) they touch) and are composited independently (see Compositor).
+  - visible = false: the layer is skipped by the Compositor, so it disappears from the canvas, thumbnails and EVERY export.
+    Editing tools refuse to write into a hidden layer.
+  - opacity (0..=255, default 255) multiplies the alpha of both planes of this layer at composite time. It never changes stored cells.
+  - name: 1..=64 chars (default "Layer <id>"; paste = "Pasted selection"; import = file name without extension).
+  - value(plane, c): the comparable value used by flood fill - PlaneValue::Ink(cell) or PlaneValue::Fill(colour).
+  - Painting REPLACES a cell value. Colours are mixed only BETWEEN layers, never inside one plane.
 end note
 
 note bottom of Frame
-  Frame background (user-editable per frame)
-  - background is an OPAQUE Rgb. Default for a new project = Rgb::BLACK (chosen in New Project modal).
-  - Add frame      : new frame background = background of the currently selected frame.
-  - Duplicate frame: copy of the source frame (grid AND background) with a fresh FrameId.
-  - set_background returns the previous colour (recorded by SetFrameBackgroundCommand) and calls touch().
-  - revision is NOT persisted. It is bumped by touch() on every mutation (set_cell, set_background);
-    thumbnails and the canvas renderer compare it to know when to redraw.
+  Frame = background colour + ordered layer stack
+  - layers[0] is the BOTTOM layer, layers[len-1] the top one (the Layers panel lists them top first). 1 <= len <= MAX_LAYERS (64).
+  - active: index of the layer the tools edit. active < layers.len().
+  - LayerId is unique inside ONE frame (allocator = next_layer_id, per frame, never reused after delete / undo).
+    duplicate_as() copies the layers, their ids and next_layer_id.
+  - set_ink / set_fill: find the layer by id, normalise the value, write, touch(), return the previous value (None = unknown layer or
+    out of bounds, nothing written). set_layer_props returns the previous props. Every mutator calls touch().
+  - Frame background (user-editable per frame): opaque Rgb under the whole stack. Default for a new project = Rgb::BLACK.
+    Add frame: new frame background = background of the selected frame, one blank layer "Layer 1".
+    Duplicate frame: copy of the source (ALL layers AND background) with a fresh FrameId.
+  - resize_canvas(cols, rows): every layer is resized (top-left anchored, new cells empty). Used only by ResizeCanvasCommand.
+  - revision is NOT persisted. It is bumped by touch() on every mutation (cells, layer props, layer list, background, canvas size);
+    thumbnails and the canvas renderer compare it to know when to re-composite and redraw.
 end note
 
 note bottom of Timeline
@@ -204,9 +381,46 @@ note bottom of Timeline
 end note
 
 note bottom of Project
-  Project.new() creates exactly ONE blank frame (id 1, background = given colour), selected = 0.
+  Project.new() creates exactly ONE frame (id 1, background = given colour) holding ONE blank layer "Layer 1", selected = 0.
   next_frame_id starts at 2 and only ever increases (never reused after delete / undo).
-  CanvasSpec is fixed at creation in this milestone (240 x 72 cells, 8 x 15 px).
+  CanvasSpec starts at 240 x 72 cells, 8 x 15 px. It can only GROW, and only through resize_canvas(), which the import
+  flow calls when the user accepts the "resize project" suggestion (cols / rows 1..=1024, cell size never changes).
+  resize_canvas(new) resizes every layer of every frame and returns the previous CanvasSpec.
+end note
+
+note right of CellBuffer
+  CellBuffer = a rectangular snippet of layer content (clipboard, move preview, import payload).
+  - origin: page position of the top-left corner at the time it was created (copy = bounding box of the selection, import = (0, 0)).
+  - mask[i]: true when the cell was part of the selection. Cells outside the mask are stored as InkCell::EMPTY / Rgba::TRANSPARENT,
+    so a buffer never carries stray content.
+  - extract(layer, sel): both planes of the layer for the selected cells.  extract_flat(flat, sel): the MERGED result
+    (flat glyph + flat ink colour, flat fill; the frame background is NOT included).
+  - into_layer(id, name, spec): a full-page blank layer with the buffer written at `origin`; cells outside the page are cut off.
+  - selected_cells(offset, spec): the mask cells at origin + local position + offset, clipped to the page (becomes the selection after paste / import).
+  - Blit rule used everywhere a buffer is written onto a layer: a source cell only overwrites when it has something -
+    ink when !ink.is_empty(), fill when fill.a > 0. Empty source cells never erase the destination.
+end note
+
+note bottom of ImportFit
+  fit_content(w, h): w, h = size of the file to import in cells.
+  - Fits    when w <= cols AND h <= rows.
+  - TooBig  when w > cols OR h > rows (either dimension is enough).
+      suggested      = same cell size, cols = min(max(cols, w), 1024), rows = min(max(rows, h), 1024)   (grow only, never shrinks)
+      cut_if_kept    = (w - cols, h - rows) each floored at 0: what falls outside the page when the user refuses the suggestion
+      cut_if_resized = (w - suggested.cols, h - suggested.rows) each floored at 0: non-zero only for files larger than 1024
+end note
+
+note right of Compositor
+  flatten() - one FlatCell per cell, layers visited from the BOTTOM layer to the TOP layer, hidden layers skipped
+  (exact steps: activity diagram 20c)
+  - glyph : the glyph of the TOPMOST layer whose ink cell has a glyph != ' ' and an effective alpha > 0
+            (e.g. layer1 = [" ","1","1"], layer2 = [" "," ","2"]  ->  [" ","1","2"]).
+  - ink   : the colours of EVERY layer that has a glyph in that cell, mixed bottom to top with Rgba::over
+            (the glyph shows the colour mix of all characters below it; layers with no glyph there do not tint).
+  - fill  : the fill colours of EVERY visible layer mixed bottom to top with Rgba::over (fully transparent fills contribute nothing).
+  - effective alpha = colour alpha scaled by layer.opacity (Rgba::scaled_alpha).
+  - FlatFrame keeps the frame background separate. page_color(c) = flat.fill.over(opaque frame background).rgb - the colour
+    under the glyph pixels. Worked example: layer1 'A' blue, layer2 'B' red at alpha 128 -> glyph 'B', ink (128,0,127,255).
 end note
 
 @enduml

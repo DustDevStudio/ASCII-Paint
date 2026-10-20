@@ -1,71 +1,83 @@
-@startuml 10a_state_edit_cell
+@startuml 10a_state_move
 !include _style.puml
-title Tool state machine - Edit cell  (events = ToolEvent, see 04)
+title Tool state machine - Move  (events = ToolEvent, see 04)
 
-state NoCursor
-state Typing {
-  Typing : data / cursor: CellCoord, anchor_col: u16, session: Option<PatchBuilder> (created lazily at the first write)
+state Idle
+state Dragging {
+  Dragging : data / anchor: CellCoord, offset: (i32, i32), selection_before: Selection, floating: Option<Arc<CellBuffer>>, builder: Option<PatchBuilder>
+  Dragging : overlay / MovePreview{ floating, offset }: the floating cells at their offset + the shifted selection outline
 }
 
-[*] --> NoCursor
-NoCursor --> Typing : PointerDown(c) [selection.permits(c)]\n/ cursor = c; anchor_col = c.col
-NoCursor --> NoCursor : PointerDown(c) [!selection.permits(c)]\n/ ignored
-NoCursor --> NoCursor : Text / Key / Delete / Backspace\n/ Ignored (no cursor)
-
-Typing --> Typing : Text(ch) [permits(cursor)]\n/ write Cell{glyph: ch, fg: brush.paint, bg: old.bg};\n   next = (min(col + 1, cols - 1), row); if permits(next) cursor = next
-Typing --> Typing : Key(Enter)\n/ cursor = (min(anchor_col, cols-1), min(row + 1, rows - 1))
-Typing --> Typing : Key(Backspace)\n/ if col > 0 { col -= 1 }; write Cell{glyph: ' ', ..old}
-Typing --> Typing : Key(Delete)\n/ write Cell{glyph: ' ', ..old}; cursor stays
-Typing --> Typing : Key(Arrow*)\n/ commit(); cursor = clamp(cursor + delta); anchor_col = cursor.col for Left/Right
-Typing --> Typing : PointerDown(c) [permits(c)]\n/ commit(); cursor = c; anchor_col = c.col
-Typing --> NoCursor : Key(Escape) | Cancel | Deactivate\n/ commit(); cursor = None
+[*] --> Idle
+Idle --> Idle : PointerDown(c) [selection empty or !selection.contains(c)]\n/ ignored
+Idle --> Idle : PointerDown(c) [selection.contains(c), move_mode = Contents, active layer hidden]\n/ Consumed, nothing happens (status bar: Layer is hidden)
+Idle --> Dragging : PointerDown(c) [selection.contains(c), move_mode = Contents, active layer visible]\n/ anchor = c; offset = (0, 0); selection_before = selection.clone();\n   floating = extract(active layer, selection); builder.clear(selected cells)  (a hole appears in the layer)
+Idle --> Dragging : PointerDown(c) [selection.contains(c), move_mode = OutlineOnly]\n/ anchor = c; offset = (0, 0); no buffer, no builder
+Dragging --> Dragging : PointerMove(Some(c))\n/ offset = clamp(c - anchor) so that selection.bounds() shifted by offset stays on the page
+Dragging --> Dragging : PointerMove(None)\n/ offset unchanged
+Dragging --> Idle : PointerUp [offset == (0, 0)]\n/ Contents: builder.rollback()  (nothing recorded)
+Dragging --> Idle : PointerUp [offset != (0, 0), Contents]\n/ builder.blit(floating, offset); selection.translate(offset);\n   history.record_applied_with_selection(builder.finish("Move cells"), SelectionChange)
+Dragging --> Idle : PointerUp [offset != (0, 0), OutlineOnly]\n/ selection.translate(offset)  (selection is not undoable)
+Dragging --> Idle : Key(Escape) | Cancel | Deactivate\n/ Contents: builder.rollback(); drag = None; selection unchanged
+Idle --> Idle : Key(Arrow*) [selection non-empty]\n/ one nudge of 1 cell (Shift = 10) = the PointerUp logic with offset = delta (clamped to the page)
+Idle --> Idle : Key / DoubleClick [otherwise]\n/ Ignored
 
 note bottom
-  commit() = if session has changes: history.record_applied(session.finish("Edit text")); session = None.
-  Typing a character with the cursor on a cell that is outside an active selection is ignored (Text is consumed, nothing written).
-  All writes go through PatchBuilder::write (live on the grid, recorded for undo).
+  Contents mode: the selected cells of the ACTIVE layer (both planes) are lifted, the layer shows a hole while dragging, and on release the cells are
+  written at the new place. Only cells that hold something overwrite the destination (blit rule); the cells left behind are empty.
+  The whole drag is ONE undo step, and undo also puts the selection back where it was.
+  The offset is clamped so that no selected cell can leave the page: nothing is ever lost at the border.
+  Outline only: just the marching ants move (no layer data changes, nothing to undo).
+  is_busy() is true in Dragging. Undo / redo always send Cancel first, which rolls a running drag back.
 end note
 @enduml
 
 @startuml 10b_state_stroke_tools
 !include _style.puml
-title Tool state machine - Clear cell and Paint cell  (StrokeTool<O>, O = ClearOperation | PaintOperation)
+title Tool state machine - Paint and Erase  (StrokeTool<O>, O = PaintOperation | EraseOperation)
 
 state Idle
-state Stroking {
-  Stroking : data / last: CellCoord, builder: PatchBuilder
-}
+Idle : data / hover: Option<CellCoord>   (drives the brush footprint outline)
+state Stroking
+Stroking : data / last: CellCoord, builder: PatchBuilder (active layer)
 
 [*] --> Idle
-Idle --> Stroking : PointerDown(c)\n/ builder = new; last = c;\n   if permits(c) write(c, op.apply(old, brush))
-Stroking --> Stroking : PointerMove(Some(c))\n/ for k in line(last, c) skipping last: if permits(k) write(k, op.apply(old, brush)); last = c
+Idle --> Idle : PointerMove(Some(c))\n/ hover = Some(c)
+Idle --> Idle : PointerDown(c) [active layer hidden]\n/ Consumed, nothing happens (status bar: Layer is hidden)
+Idle --> Stroking : PointerDown(c)\n/ builder = new(frame id, active layer id); last = c;\n   op.stamp(c)  (checks selection.permits per target cell, writes the planes switched on)
+Stroking --> Stroking : PointerMove(Some(c))\n/ for k in line(last, c) skipping last: op.stamp(k); last = c; hover = c
 Stroking --> Stroking : PointerMove(None)\n/ ignored (pointer left the page; last unchanged)
 Stroking --> Idle : PointerUp(_)\n/ commit()
 Stroking --> Idle : Cancel | Deactivate\n/ commit()
-Idle --> Idle : Key / Text\n/ Ignored
+Idle --> Idle : Key\n/ Ignored
 
 note bottom
   commit() = if let Some(cmd) = builder.finish(op.label()) { history.record_applied(cmd) }.
-  A stroke that changed nothing (e.g. painting a cell with the colour it already has) records NOTHING.
+  A stroke that changed nothing (e.g. painting a cell with the value it already has, or no plane switched on) records NOTHING.
   One continuous drag = one undo step, even when it crosses many cells.
-  Active selection: cells outside the selection are skipped per cell, the stroke itself keeps running.
+  Paint stamps the active brush (glyph cells only) on every cell of the stroke: planes.foreground writes glyph + char colour, planes.background writes the fill colour.
+  Erase clears an erase_size x erase_size square: planes.foreground -> empty glyph, planes.background -> transparent fill.
+  Active selection: target cells outside the selection are skipped per cell, the stroke itself keeps running.
 end note
 @enduml
 
 @startuml 10c_state_fill
 !include _style.puml
-title Tool state machine - Fill cell  (stateless: every click is atomic)
+title Tool state machine - Fill  (stateless: every click is atomic)
 
 state Idle
 
 [*] --> Idle
+Idle --> Idle : PointerDown(c) [active layer hidden]\n/ Consumed, nothing happens (status bar: Layer is hidden)
 Idle --> Idle : PointerDown(c) [selection non-empty and !selection.contains(c)]\n/ ignored
-Idle --> Idle : PointerDown(c) [seed already has the paint colour in brush.channel]\n/ nothing to do, nothing recorded
-Idle --> Idle : PointerDown(c) [otherwise]\n/ cells = FloodFill::region(grid, c, brush.channel, &selection);\n   one PatchBuilder: Foreground -> Cell{fg: paint, ..old}, Background -> Cell{bg: Some(paint), ..old};\n   history.record_applied(builder.finish("Fill cells"))
-Idle --> Idle : PointerMove / PointerUp / Key / Text / Cancel / Deactivate\n/ Ignored
+Idle --> Idle : PointerDown(c) [no plane switched on, or in every switched-on plane the seed already holds the target value]\n/ nothing to do, nothing recorded
+Idle --> Idle : PointerDown(c) [otherwise]\n/ for EACH plane in options.planes: cells = FloodFill::region(active layer, c, plane, &selection);\n   one PatchBuilder: Foreground -> InkCell{glyph: brush.fill_glyph(), color: ink}, Background -> fill_color;\n   history.record_applied(builder.finish("Fill cells"))
+Idle --> Idle : PointerMove / PointerUp / Key / Cancel / Deactivate\n/ Ignored
 
 note bottom
-  The fill is computed and applied entirely inside the PointerDown handler (4-connected scanline fill, max 17 280 cells).
+  The fill is computed and applied entirely inside the PointerDown handler (4-connected scanline fill, max 17 280 cells per plane at the default canvas).
+  The two planes are filled INDEPENDENTLY: the foreground region is bounded by differences in glyph / character colour, the background region only by
+  differences in fill colour, and neither looks at other layers. With both planes on, two regions are written in one undo step.
   There is no preview and no drag behaviour.
 end note
 @enduml
@@ -81,14 +93,14 @@ state Dragging {
 }
 
 [*] --> Idle
-Idle --> Dragging : PointerDown(c, mods)\n/ drag = {anchor: c, current: c, mode: mods.selection_mode()}
+Idle --> Dragging : PointerDown(c, mods)\n/ drag = {anchor: c, current: c, mode: options.mode_for(mods)}
 Dragging --> Dragging : PointerMove(Some(c))\n/ current = c
 Dragging --> Dragging : PointerMove(None)\n/ current = clamp(last known pointer position to the page)
 Dragging --> Idle : PointerUp(_)\n/ cells = shape.rasterize(anchor, current, spec);\n   selection.apply(cells, mode)
 Dragging --> Idle : Key(Escape) | Cancel | Deactivate\n/ drag = None  (selection unchanged)
 
 note bottom
-  mode: no modifier = Replace, Shift = Add, Alt = Subtract. The modifier is read ONCE at PointerDown.
+  mode: a held Alt = Subtract, a held Shift = Add, otherwise the Replace / Add / Subtract button of the top bar. The modifier is read ONCE at PointerDown.
   A click without moving selects the single cell under the pointer (anchor == current -> 1 x 1 shape).
 end note
 @enduml
@@ -104,7 +116,7 @@ state Building {
 }
 
 [*] --> Idle
-Idle --> Building : PointerDown(c, mods)\n/ vertices = [c]; mode = mods.selection_mode()
+Idle --> Building : PointerDown(c, mods)\n/ vertices = [c]; mode = options.mode_for(mods)
 Building --> Building : PointerDown(c) [c == last vertex]\n/ ignored (absorbs the 2nd click of a double-click)
 Building --> Building : PointerDown(c) [c == vertices[0] and n < 3]\n/ ignored
 Building --> Building : PointerDown(c) [otherwise, not closing]\n/ vertices.push(c)
@@ -119,7 +131,34 @@ note bottom
   close(): if n < 3 -> vertices.clear() (nothing selected).
           else cells = ShapeRasterizer::polygon(vertices, spec); selection.apply(cells, mode); vertices.clear().
   The polygon is closed automatically from the last vertex back to the first. Vertices sit at cell CENTRES.
-  The selection modifier (Shift / Alt) is read at the FIRST click only.
+  The selection mode (Alt / Shift / top bar button) is read at the FIRST click only.
   is_busy() is true in Building. Undo / redo always send Cancel first, which discards the polygon.
+end note
+@enduml
+
+@startuml 10f_state_pick
+!include _style.puml
+title Tool state machine - Pick (colour picker)  (never writes into the project)
+
+state Idle
+Idle : data / hover: Option<CellCoord>
+state Sampling
+Sampling : data / hover: CellCoord   (primary button held: dragging scrubs through cells)
+
+[*] --> Idle
+Idle --> Idle : PointerMove(Some(c))\n/ hover = Some(c)   (overlay: one-cell outline)
+Idle --> Sampling : PointerDown(c)\n/ sample(c) -> ToolResponse::Picked(PickedColors)
+Sampling --> Sampling : PointerMove(Some(c))\n/ hover = c; sample(c) -> ToolResponse::Picked(PickedColors)
+Sampling --> Sampling : PointerMove(None)\n/ ignored
+Sampling --> Idle : PointerUp(_) | Cancel | Deactivate\n/ nothing to commit
+Idle --> Idle : Key / DoubleClick\n/ Ignored
+
+note bottom
+  sample(c), driven by options.planes (the paint mode) and options.pick_source:
+    planes.foreground -> ink  = character colour at c    (Merged: Compositor::flatten_cell(...).ink when it has a glyph | ActiveLayer: the layer's ink colour when it has a glyph)
+    planes.background -> fill = background colour at c   (Merged: flatten_cell(...).fill when its alpha > 0 | ActiveLayer: the layer's fill colour when its alpha > 0)
+  A plane with nothing at c yields None (that colour is left alone, status bar: No character here / No background here).
+  The caller applies the answer: EditorSession::apply_picked sets ink_color / fill_color. Colours keep their alpha. The glyph / brush is never picked.
+  Picking is not undoable and does not make the project dirty. The selection does not restrict it. is_busy() is always false.
 end note
 @enduml
