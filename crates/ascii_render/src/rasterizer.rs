@@ -1,4 +1,5 @@
-use ascii_core::model::{CanvasSpec, Frame};
+use ascii_core::compose::FlatFrame;
+use ascii_core::model::CanvasSpec;
 use crate::glyph_source::GlyphSource;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -55,27 +56,27 @@ impl RgbaBuffer {
 pub struct FrameRasterizer;
 
 impl FrameRasterizer {
-    pub fn render(frame: &Frame, canvas: &CanvasSpec, glyphs: &dyn GlyphSource) -> RgbaBuffer {
+    pub fn render(flat: &FlatFrame, canvas: &CanvasSpec, glyphs: &dyn GlyphSource) -> RgbaBuffer {
         let cell_w = canvas.cell_w as u32;
         let cell_h = canvas.cell_h as u32;
         let width = canvas.cols as u32 * cell_w;
         let height = canvas.rows as u32 * cell_h;
 
         let bg_rgba = [
-            frame.background.r,
-            frame.background.g,
-            frame.background.b,
+            flat.background.r,
+            flat.background.g,
+            flat.background.b,
             255,
         ];
         let mut buf = RgbaBuffer::filled(width, height, bg_rgba);
 
-        for (coord, cell) in frame.grid.iter() {
+        for (coord, cell) in flat.grid.iter() {
             let x0 = coord.col as u32 * cell_w;
             let y0 = coord.row as u32 * cell_h;
 
-            // Fill cell background if present
-            if let Some(c) = cell.bg {
-                let cell_bg_rgba = [c.r, c.g, c.b, 255];
+            if cell.fill.a > 0 {
+                let base = flat.page_color(coord);
+                let cell_bg_rgba = [base.r, base.g, base.b, 255];
                 for dy in 0..cell_h {
                     for dx in 0..cell_w {
                         buf.set_pixel(x0 + dx, y0 + dy, cell_bg_rgba);
@@ -83,32 +84,34 @@ impl FrameRasterizer {
                 }
             }
 
-            // Draw glyph if not space
             if cell.glyph != ' ' {
                 let mask = glyphs.mask(cell.glyph);
-                let fg = cell.fg;
+                let ink = cell.ink;
                 for my in 0..cell_h {
                     for mx in 0..cell_w {
                         let mask_idx = (my * cell_w + mx) as usize;
                         if mask_idx < mask.alpha.len() {
-                            let a = mask.alpha[mask_idx] as u32;
-                            if a > 0 {
-                                let px_x = x0 + mx;
-                                let px_y = y0 + my;
-                                if px_x < width && px_y < height {
-                                    let idx = ((px_y * width + px_x) * 4) as usize;
-                                    let pr = buf.pixels[idx] as u32;
-                                    let pg = buf.pixels[idx + 1] as u32;
-                                    let pb = buf.pixels[idx + 2] as u32;
+                            let m = mask.alpha[mask_idx] as u32;
+                            if m > 0 {
+                                let a = (m * ink.a as u32 + 127) / 255;
+                                if a > 0 {
+                                    let px_x = x0 + mx;
+                                    let px_y = y0 + my;
+                                    if px_x < width && px_y < height {
+                                        let idx = ((px_y * width + px_x) * 4) as usize;
+                                        let pr = buf.pixels[idx] as u32;
+                                        let pg = buf.pixels[idx + 1] as u32;
+                                        let pb = buf.pixels[idx + 2] as u32;
 
-                                    let out_r = ((pr * (255 - a) + fg.r as u32 * a + 127) / 255) as u8;
-                                    let out_g = ((pg * (255 - a) + fg.g as u32 * a + 127) / 255) as u8;
-                                    let out_b = ((pb * (255 - a) + fg.b as u32 * a + 127) / 255) as u8;
+                                        let out_r = ((pr * (255 - a) + ink.r as u32 * a + 127) / 255) as u8;
+                                        let out_g = ((pg * (255 - a) + ink.g as u32 * a + 127) / 255) as u8;
+                                        let out_b = ((pb * (255 - a) + ink.b as u32 * a + 127) / 255) as u8;
 
-                                    buf.pixels[idx] = out_r;
-                                    buf.pixels[idx + 1] = out_g;
-                                    buf.pixels[idx + 2] = out_b;
-                                    buf.pixels[idx + 3] = 255;
+                                        buf.pixels[idx] = out_r;
+                                        buf.pixels[idx + 1] = out_g;
+                                        buf.pixels[idx + 2] = out_b;
+                                        buf.pixels[idx + 3] = 255;
+                                    }
                                 }
                             }
                         }

@@ -1,21 +1,22 @@
-use ascii_core::model::Frame;
+use ascii_core::compose::FlatFrame;
+use ascii_core::model::Rgba;
 use crate::rasterizer::RgbaBuffer;
 
 pub struct ThumbnailBuilder;
 
 impl ThumbnailBuilder {
-    pub fn build(frame: &Frame) -> RgbaBuffer {
-        let cols = frame.grid.cols() as u32;
-        let rows = frame.grid.rows() as u32;
+    pub fn build(flat: &FlatFrame) -> RgbaBuffer {
+        let cols = flat.grid.cols() as u32;
+        let rows = flat.grid.rows() as u32;
         let mut buf = RgbaBuffer::new(cols, rows);
 
-        for (coord, cell) in frame.grid.iter() {
-            let base = cell.bg.unwrap_or(frame.background);
+        for (coord, cell) in flat.grid.iter() {
+            let base = flat.page_color(coord);
             let [r, g, b] = if cell.glyph != ' ' {
-                // lerp(base, cell.fg, 0.6)
-                let r = (base.r as f32 * 0.4 + cell.fg.r as f32 * 0.6).round() as u8;
-                let g = (base.g as f32 * 0.4 + cell.fg.g as f32 * 0.6).round() as u8;
-                let b = (base.b as f32 * 0.4 + cell.fg.b as f32 * 0.6).round() as u8;
+                let ink_opaque = cell.ink.over(Rgba::opaque(base)).rgb();
+                let r = ((base.r as u32 * 4 + ink_opaque.r as u32 * 6 + 5) / 10) as u8;
+                let g = ((base.g as u32 * 4 + ink_opaque.g as u32 * 6 + 5) / 10) as u8;
+                let b = ((base.b as u32 * 4 + ink_opaque.b as u32 * 6 + 5) / 10) as u8;
                 [r, g, b]
             } else {
                 [base.r, base.g, base.b]

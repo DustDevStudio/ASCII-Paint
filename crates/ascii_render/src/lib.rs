@@ -9,7 +9,8 @@ pub use thumbnail::ThumbnailBuilder;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ascii_core::model::{CanvasSpec, Cell, CellCoord, Frame, FrameId, Rgb};
+    use ascii_core::compose::Compositor;
+    use ascii_core::model::{CanvasSpec, CellCoord, Frame, FrameId, InkCell, Rgb, Rgba};
 
     #[test]
     fn test_ttf_glyph_source_loading_and_mask() {
@@ -22,7 +23,6 @@ mod tests {
         assert_eq!(mask.width, 8);
         assert_eq!(mask.height, 15);
         assert_eq!(mask.alpha.len(), 8 * 15);
-        // Alpha for 'A' should have non-zero pixels
         assert!(mask.alpha.iter().any(|&a| a > 0));
     }
 
@@ -35,25 +35,26 @@ mod tests {
             cell_h: 15,
         };
         let mut frame = Frame::blank(FrameId(1), &spec, Rgb::BLACK);
-        frame.set_cell(
+        let layer_id = frame.active_layer().id;
+        frame.set_ink(
+            layer_id,
             CellCoord::new(0, 0),
-            Cell {
-                glyph: 'H',
-                fg: Rgb::WHITE,
-                bg: None,
-            },
+            InkCell::new('H', Rgba::WHITE),
         );
-        frame.set_cell(
+        frame.set_ink(
+            layer_id,
             CellCoord::new(1, 0),
-            Cell {
-                glyph: 'i',
-                fg: Rgb::new(255, 0, 0),
-                bg: Some(Rgb::new(0, 0, 255)),
-            },
+            InkCell::new('i', Rgba::new(255, 0, 0, 255)),
+        );
+        frame.set_fill(
+            layer_id,
+            CellCoord::new(1, 0),
+            Rgba::new(0, 0, 255, 255),
         );
 
+        let flat = Compositor::flatten(&frame, &spec);
         let glyphs = TtfGlyphSource::load_default(8, 15).unwrap();
-        let buf = FrameRasterizer::render(&frame, &spec, &glyphs);
+        let buf = FrameRasterizer::render(&flat, &spec, &glyphs);
         assert_eq!(buf.width, 16);
         assert_eq!(buf.height, 15);
         assert_eq!(buf.pixels.len(), 16 * 15 * 4);
@@ -73,7 +74,8 @@ mod tests {
             cell_h: 15,
         };
         let frame = Frame::blank(FrameId(1), &spec, Rgb::new(10, 20, 30));
-        let thumb = ThumbnailBuilder::build(&frame);
+        let flat = Compositor::flatten(&frame, &spec);
+        let thumb = ThumbnailBuilder::build(&flat);
         assert_eq!(thumb.width, 2);
         assert_eq!(thumb.height, 1);
         assert_eq!(thumb.get_pixel(0, 0), Some([10, 20, 30, 255]));
