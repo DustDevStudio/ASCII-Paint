@@ -1,3 +1,4 @@
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -7,6 +8,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use thiserror::Error;
 
+use ascii_core::compose::Compositor;
 use ascii_core::model::{CanvasSpec, Fps, Frame, Project};
 use ascii_render::{FrameRasterizer, GlyphSource};
 use crate::format::{AanimCodec, AsciiAnimation, AsciiCodec, AsciiImage, FormatCodec, FormatError};
@@ -56,6 +58,103 @@ impl ExportJobHandle {
     }
 }
 
+pub struct SequenceNamer;
+
+impl SequenceNamer {
+    pub fn names(base: &str, count: usize) -> Vec<String> {
+        let count_digits = if count == 0 {
+            1
+        } else {
+            (count as f64).log10().floor() as usize + 1
+        };
+        let pad_width = count_digits.max(3);
+
+        (1..=count)
+            .map(|i| format!("{}_frame{:0width$}.ascii", base, i, width = pad_width))
+            .collect()
+    }
+}
+
+pub struct AsciiSequenceWorker {
+    pub frames: Vec<Frame>,
+    pub canvas: CanvasSpec,
+    pub font_name: String,
+    pub folder: PathBuf,
+    pub names: Vec<String>,
+}
+
+impl AsciiSequenceWorker {
+    pub fn run(self, tx: Sender<ExportMessage>, cancel: Arc<AtomicBool>) {
+        let total = self.frames.len() as u32;
+        let mut parts = Vec::new();
+
+        for (i, frame) in self.frames.iter().enumerate() {
+            if cancel.load(Ordering::SeqCst) {
+                for p in &parts {
+                    let _ = fs::remove_file(p);
+                }
+                let _ = tx.send(ExportMessage::Cancelled);
+                return;
+            }
+
+            let part_path = self.folder.join(format!("{}.part", self.names[i]));
+            let flat = Compositor::flatten(frame, &self.canvas);
+            let image = AsciiImage {
+                canvas: self.canvas,
+                font_name: self.font_name.clone(),
+                frame: flat,
+            };
+
+            let bytes = match (AsciiCodec).encode(&image) {
+                Ok(b) => b,
+                Err(e) => {
+                    for p in &parts {
+                        let _ = fs::remove_file(p);
+                    }
+                    let _ = tx.send(ExportMessage::Failed(e.to_string()));
+                    return;
+                }
+            };
+
+            let write_res = (|| -> io::Result<()> {
+                let mut f = File::create(&part_path)?;
+                f.write_all(&bytes)?;
+                f.flush()?;
+                f.sync_all()?;
+                Ok(())
+            })();
+
+            if let Err(e) = write_res {
+                for p in &parts {
+                    let _ = fs::remove_file(p);
+                }
+                let _ = tx.send(ExportMessage::Failed(e.to_string()));
+                return;
+            }
+
+            parts.push(part_path);
+            let _ = tx.send(ExportMessage::Progress(i as u32 + 1, total));
+        }
+
+        // Rename parts to final names
+        for (i, part_path) in parts.iter().enumerate() {
+            let final_path = self.folder.join(&self.names[i]);
+            if let Err(e) = fs::rename(part_path, &final_path) {
+                for remaining in &parts[i..] {
+                    let _ = fs::remove_file(remaining);
+                }
+                let _ = tx.send(ExportMessage::Failed(format!(
+                    "Failed to rename {}: {}",
+                    self.names[i], e
+                )));
+                return;
+            }
+        }
+
+        let _ = tx.send(ExportMessage::Finished(self.folder));
+    }
+}
+
 pub struct FfmpegLocator;
 
 impl FfmpegLocator {
@@ -97,12 +196,12 @@ impl Clock {
 }
 
 pub struct Mp4Worker {
-    frames: Vec<Frame>,
-    canvas: CanvasSpec,
-    fps: Fps,
-    out: PathBuf,
-    ffmpeg: PathBuf,
-    glyphs: Arc<dyn GlyphSource>,
+    pub frames: Vec<Frame>,
+    pub canvas: CanvasSpec,
+    pub fps: Fps,
+    pub out: PathBuf,
+    pub ffmpeg: PathBuf,
+    pub glyphs: Arc<dyn GlyphSource>,
 }
 
 impl Mp4Worker {
@@ -169,7 +268,6 @@ impl Mp4Worker {
             }
         };
 
-        // Drain stderr in background thread
         let mut stderr = child.stderr.take();
         let stderr_thread = thread::spawn(move || {
             let mut tail = Vec::new();
@@ -200,7 +298,8 @@ impl Mp4Worker {
                 return;
             }
 
-            let buf = FrameRasterizer::render(frame, &self.canvas, self.glyphs.as_ref());
+            let flat = Compositor::flatten(frame, &self.canvas);
+            let buf = FrameRasterizer::render(&flat, &self.canvas, self.glyphs.as_ref());
             if let Err(e) = stdin.write_all(&buf.pixels) {
                 let _ = child.kill();
                 drop(stdin);
@@ -258,7 +357,8 @@ impl ExportService {
         glyphs: &dyn GlyphSource,
     ) -> Result<(), ExportError> {
         let frame = project.timeline.selected_frame();
-        let buf = FrameRasterizer::render(frame, &project.canvas, glyphs);
+        let flat = Compositor::flatten(frame, &project.canvas);
+        let buf = FrameRasterizer::render(&flat, &project.canvas, glyphs);
 
         let mut png_bytes = Vec::new();
         let encoder = image::codecs::png::PngEncoder::new(&mut png_bytes);
@@ -282,10 +382,12 @@ impl ExportService {
         path: &Path,
         glyphs: &dyn GlyphSource,
     ) -> Result<(), ExportError> {
+        let frame = project.timeline.selected_frame();
+        let flat = Compositor::flatten(frame, &project.canvas);
         let image = AsciiImage {
             canvas: project.canvas,
             font_name: glyphs.font_name().to_string(),
-            frame: project.timeline.selected_frame().clone(),
+            frame: flat,
         };
         let codec = AsciiCodec;
         let bytes = codec.encode(&image)?;
@@ -299,17 +401,55 @@ impl ExportService {
         path: &Path,
         glyphs: &dyn GlyphSource,
     ) -> Result<(), ExportError> {
+        let flat_frames: Vec<_> = project
+            .timeline
+            .frames()
+            .iter()
+            .map(|f| Compositor::flatten(f, &project.canvas))
+            .collect();
         let anim = AsciiAnimation {
             canvas: project.canvas,
             font_name: glyphs.font_name().to_string(),
             fps: project.timeline.fps,
             looping: project.timeline.looping,
-            frames: project.timeline.frames().to_vec(),
+            frames: flat_frames,
         };
         let codec = AanimCodec;
         let bytes = codec.encode(&anim)?;
         AtomicWriter::write(path, &bytes)?;
         Ok(())
+    }
+
+    pub fn start_ascii_sequence(
+        &self,
+        project: &Project,
+        folder: PathBuf,
+        base: String,
+        glyphs: Arc<dyn GlyphSource>,
+    ) -> ExportJobHandle {
+        let (tx, rx) = channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = Arc::clone(&cancel);
+
+        let names = SequenceNamer::names(&base, project.timeline.len());
+
+        let worker = AsciiSequenceWorker {
+            frames: project.timeline.frames().to_vec(),
+            canvas: project.canvas,
+            font_name: glyphs.font_name().to_string(),
+            folder,
+            names,
+        };
+
+        let handle = thread::spawn(move || {
+            worker.run(tx, cancel_clone);
+        });
+
+        ExportJobHandle {
+            rx,
+            cancel,
+            _join: Some(handle),
+        }
     }
 
     pub fn start_mp4(
