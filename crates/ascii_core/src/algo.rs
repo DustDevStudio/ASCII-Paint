@@ -1,59 +1,47 @@
 use std::collections::BTreeSet;
 
-use crate::model::{CanvasSpec, CellCoord, CellRect, Grid, Rgb};
+use crate::model::{CanvasSpec, CellCoord, CellRect, Layer, Plane};
 use crate::selection::Selection;
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum PaintChannel {
-    Foreground,
-    Background,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-enum ChannelValue {
-    Fg(Rgb),
-    Bg(Option<Rgb>),
-}
 
 pub struct FloodFill;
 
 impl FloodFill {
     pub fn region(
-        grid: &Grid,
+        layer: &Layer,
         seed: CellCoord,
-        channel: PaintChannel,
+        plane: Plane,
         limit: &Selection,
     ) -> Vec<CellCoord> {
-        let cols = grid.cols() as usize;
-        let rows = grid.rows() as usize;
+        let cols = layer.ink.cols() as usize;
+        let rows = layer.ink.rows() as usize;
         if seed.col as usize >= cols || seed.row as usize >= rows {
             return Vec::new();
         }
 
-        let value_at = |c: CellCoord| -> ChannelValue {
-            let cell = grid.get(c).copied().unwrap_or_default();
-            match channel {
-                PaintChannel::Foreground => ChannelValue::Fg(cell.fg),
-                PaintChannel::Background => ChannelValue::Bg(cell.bg),
-            }
+        let target = match layer.value(plane, seed) {
+            Some(v) => v,
+            None => return Vec::new(),
         };
 
-        let target = value_at(seed);
         let mut visited = vec![false; cols * rows];
         let mut result = Vec::new();
         let mut stack = vec![(seed.col as usize, seed.row as usize)];
+
+        let value_matches = |c: CellCoord| -> bool {
+            layer.value(plane, c) == Some(target)
+        };
 
         let ok = |x: usize, y: usize, visited: &[bool]| -> bool {
             if x >= cols || y >= rows {
                 return false;
             }
             let coord = CellCoord::new(x as u16, y as u16);
-            !visited[y * cols + x] && limit.permits(coord) && value_at(coord) == target
+            !visited[y * cols + x] && limit.permits(coord) && value_matches(coord)
         };
 
         while let Some((x, y)) = stack.pop() {
             let coord = CellCoord::new(x as u16, y as u16);
-            if visited[y * cols + x] || !limit.permits(coord) || value_at(coord) != target {
+            if visited[y * cols + x] || !limit.permits(coord) || !value_matches(coord) {
                 continue;
             }
 

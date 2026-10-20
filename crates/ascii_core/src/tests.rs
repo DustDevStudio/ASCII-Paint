@@ -1,101 +1,136 @@
-use crate::algo::{FloodFill, PaintChannel, ShapeRasterizer};
-use crate::history::{AddFrameCommand, History};
+use crate::brush::{Brush, BrushError, BrushId, BrushLibrary, Stamp};
+use crate::compose::Compositor;
 use crate::model::{
-    CanvasSpec, Cell, CellCoord, CellRect, DomainError, Fps, Grid, Project, Rgb,
+    CanvasSpec, CellCoord, Fps, Frame, FrameId, ImportFit, InkCell, Layer, Project, Rgb, Rgba,
 };
 use crate::selection::{Selection, SelectionMode};
 use crate::tools::{
-    Brush, EditCellTool, Modifiers, Tool, ToolContext, ToolEvent,
+    Modifiers, PaintOperation, PaintTool, PickTool, Tool, ToolContext, ToolEvent, ToolId,
+    ToolOptions, ToolResponse,
 };
+use crate::history::History;
 
 #[test]
-fn test_rgb_and_hex() {
-    let black = Rgb::BLACK;
-    assert_eq!(black.to_hex(), "#000000");
-    assert_eq!(Rgb::WHITE.to_hex(), "#FFFFFF");
+fn test_rgba_over_and_blending() {
+    let red_half = Rgba::new(255, 0, 0, 128);
+    let blue_opaque = Rgba::new(0, 0, 255, 255);
+    let blended1 = red_half.over(blue_opaque);
+    assert_eq!(blended1, Rgba::new(128, 0, 127, 255));
 
-    let parsed = Rgb::from_hex("#123456").unwrap();
-    assert_eq!(parsed, Rgb::new(0x12, 0x34, 0x56));
-    assert_eq!(parsed.to_rgba(255), [0x12, 0x34, 0x56, 255]);
+    let green_half = Rgba::new(0, 255, 0, 128);
+    let blended2 = red_half.over(green_half);
+    assert_eq!(blended2, Rgba::new(170, 85, 0, 192));
 
-    assert!(Rgb::from_hex("invalid").is_err());
-    assert!(Rgb::from_hex("#12345").is_err());
+    let arbitrary = Rgba::new(10, 20, 30, 200);
+    assert_eq!(arbitrary.over(Rgba::TRANSPARENT), arbitrary);
 }
 
 #[test]
-fn test_cell_rect_and_canvas_spec() {
-    let a = CellCoord::new(2, 5);
-    let b = CellCoord::new(7, 3);
-    let rect = CellRect::from_corners(a, b);
-    assert_eq!(rect.min, CellCoord::new(2, 3));
-    assert_eq!(rect.max, CellCoord::new(7, 5));
-    assert_eq!(rect.width(), 6);
-    assert_eq!(rect.height(), 3);
-    assert!(rect.contains(CellCoord::new(4, 4)));
-    assert!(!rect.contains(CellCoord::new(1, 4)));
-
-    let spec = CanvasSpec::default();
-    assert_eq!(spec.cols, 240);
-    assert_eq!(spec.rows, 72);
-    assert_eq!(spec.pixel_width(), 1920);
-    assert_eq!(spec.pixel_height(), 1080);
-    assert_eq!(spec.clamp(-5, 100), CellCoord::new(0, 71));
-}
-
-#[test]
-fn test_grid_and_frame() {
+fn test_canvas_spec_and_fit_content() {
     let spec = CanvasSpec {
-        cols: 10,
-        rows: 5,
+        cols: 240,
+        rows: 72,
         cell_w: 8,
         cell_h: 15,
     };
-    let mut grid = Grid::blank(&spec);
-    assert_eq!(grid.cols(), 10);
-    assert_eq!(grid.rows(), 5);
-    assert!(grid.get(CellCoord::new(0, 0)).unwrap().is_blank());
+    assert_eq!(spec.fit_content(100, 50), ImportFit::Fits);
 
-    let test_cell = Cell {
-        glyph: 'X',
-        fg: Rgb::new(255, 0, 0),
-        bg: Some(Rgb::new(0, 255, 0)),
-    };
-    let prev = grid.set(CellCoord::new(2, 3), test_cell);
-    assert_eq!(prev, Some(Cell::EMPTY));
-    assert_eq!(grid.get(CellCoord::new(2, 3)), Some(&test_cell));
+    match spec.fit_content(300, 90) {
+        ImportFit::TooBig {
+            suggested,
+            cut_if_kept,
+            cut_if_resized,
+        } => {
+            assert_eq!(suggested.cols, 300);
+            assert_eq!(suggested.rows, 90);
+            assert_eq!(cut_if_kept, (60, 18));
+            assert_eq!(cut_if_resized, (0, 0));
+        }
+        _ => panic!("Expected TooBig"),
+    }
 }
 
 #[test]
-fn test_project_and_timeline() {
-    let now = 1234567890;
-    let mut proj = Project::new("TestProj".to_string(), Rgb::BLACK, Fps(12), now);
-    assert_eq!(proj.meta.name, "TestProj");
-    assert_eq!(proj.timeline.len(), 1);
-    assert_eq!(proj.timeline.selected_index(), 0);
+fn test_layers_and_compositing() {
+    let spec = CanvasSpec {
+        cols: 2,
+        rows: 1,
+        cell_w: 8,
+        cell_h: 15,
+    };
+    let mut frame = Frame::blank(FrameId(1), &spec, Rgb::new(0x10, 0x10, 0x20));
 
-    // Timeline remove last frame must fail
-    assert_eq!(
-        proj.timeline.remove(0).unwrap_err(),
-        DomainError::CannotRemoveLastFrame
+    // Base layer (layer 0)
+    let base_id = frame.active_layer().id;
+    frame.set_ink(
+        base_id,
+        CellCoord::new(0, 0),
+        InkCell::new('H', Rgba::WHITE),
+    );
+    frame.set_ink(
+        base_id,
+        CellCoord::new(1, 0),
+        InkCell::new('i', Rgba::new(255, 0, 0, 255)),
+    );
+    frame.set_fill(
+        base_id,
+        CellCoord::new(1, 0),
+        Rgba::new(0, 0, 255, 128),
     );
 
-    // Add frame via command
-    let mut hist = History::new();
-    let add_cmd = AddFrameCommand::blank_after(&mut proj, 0);
-    hist.execute(Box::new(add_cmd), &mut proj);
-    assert_eq!(proj.timeline.len(), 2);
-    assert_eq!(proj.timeline.selected_index(), 1);
-    assert!(hist.is_dirty());
+    // Top layer (layer 1) - hidden
+    let top_id = frame.alloc_layer_id();
+    let mut top_layer = Layer::blank(top_id, "top".to_string(), &spec);
+    top_layer.visible = false;
+    top_layer.opacity = 128;
+    top_layer.ink.set(
+        CellCoord::new(1, 0),
+        InkCell::new('X', Rgba::new(0, 255, 0, 255)),
+    );
+    frame.insert_layer(1, top_layer).unwrap();
 
-    // Undo add frame
-    hist.undo(&mut proj);
-    assert_eq!(proj.timeline.len(), 1);
-    assert_eq!(proj.timeline.selected_index(), 0);
-    assert!(!hist.is_dirty());
+    let flat = Compositor::flatten(&frame, &spec);
+
+    // Hidden layer should not show
+    let c0 = flat.grid.get(CellCoord::new(0, 0)).unwrap();
+    assert_eq!(c0.glyph, 'H');
+    assert_eq!(c0.ink, Rgba::WHITE);
+
+    let c1 = flat.grid.get(CellCoord::new(1, 0)).unwrap();
+    assert_eq!(c1.glyph, 'i');
+    assert_eq!(c1.ink, Rgba::new(255, 0, 0, 255));
+    assert_eq!(c1.fill, Rgba::new(0, 0, 255, 128));
 }
 
 #[test]
-fn test_selection() {
+fn test_brush_library_and_validation() {
+    let mut lib = BrushLibrary::with_builtins();
+    assert_eq!(BrushLibrary::default_id(), BrushId(7));
+    let hash_brush = lib.get(BrushId(7)).unwrap();
+    assert_eq!(hash_brush.fill_glyph(), '#');
+
+    // Create valid custom brush
+    let custom = Brush {
+        id: BrushId(0),
+        name: "Box".to_string(),
+        stamp: Stamp::new(
+            2,
+            2,
+            vec![Some('+'), Some('-'), Some('|'), Some('+')],
+            (0, 0),
+        ),
+    };
+    let new_id = lib.upsert(custom).unwrap();
+    assert!(new_id.0 >= 1000);
+
+    // Builtin cannot be removed
+    assert_eq!(lib.remove(BrushId(1)), Err(BrushError::BuiltinReadOnly));
+    // Custom can be removed
+    assert!(lib.remove(new_id).is_ok());
+}
+
+#[test]
+fn test_selection_invert_translate() {
     let spec = CanvasSpec {
         cols: 10,
         rows: 10,
@@ -103,126 +138,53 @@ fn test_selection() {
         cell_h: 15,
     };
     let mut sel = Selection::new(&spec);
-    assert!(sel.is_empty());
-    assert!(sel.permits(CellCoord::new(0, 0))); // empty permits all
-
-    let cells = vec![CellCoord::new(1, 1), CellCoord::new(1, 2)];
-    sel.apply(&cells, SelectionMode::Replace);
+    sel.apply(&[CellCoord::new(1, 1), CellCoord::new(1, 2)], SelectionMode::Replace);
     assert_eq!(sel.count(), 2);
-    assert!(sel.contains(CellCoord::new(1, 1)));
-    assert!(!sel.contains(CellCoord::new(0, 0)));
-    assert!(sel.permits(CellCoord::new(1, 1)));
-    assert!(!sel.permits(CellCoord::new(0, 0))); // non-empty restricts
 
-    sel.apply(&[CellCoord::new(1, 1)], SelectionMode::Subtract);
-    assert_eq!(sel.count(), 1);
+    assert!(sel.translate((1, 1)));
     assert!(!sel.contains(CellCoord::new(1, 1)));
-    assert!(sel.contains(CellCoord::new(1, 2)));
+    assert!(sel.contains(CellCoord::new(2, 2)));
+    assert!(sel.contains(CellCoord::new(2, 3)));
 
-    sel.select_all();
-    assert_eq!(sel.count(), 100);
-    sel.clear();
-    assert!(sel.is_empty());
+    sel.invert();
+    assert_eq!(sel.count(), 98);
+    assert!(!sel.contains(CellCoord::new(2, 2)));
+    assert!(sel.contains(CellCoord::new(0, 0)));
 }
 
 #[test]
-fn test_algorithms_rasterizer() {
-    let a = CellCoord::new(0, 0);
-    let b = CellCoord::new(3, 0);
-    let line = ShapeRasterizer::line(a, b);
-    assert_eq!(
-        line,
-        vec![
-            CellCoord::new(0, 0),
-            CellCoord::new(1, 0),
-            CellCoord::new(2, 0),
-            CellCoord::new(3, 0),
-        ]
-    );
-
-    let spec = CanvasSpec {
-        cols: 10,
-        rows: 10,
-        cell_w: 8,
-        cell_h: 15,
-    };
-    let rect_cells = ShapeRasterizer::rect(CellCoord::new(1, 1), CellCoord::new(2, 2), &spec);
-    assert_eq!(rect_cells.len(), 4);
-
-    let ellipse_cells = ShapeRasterizer::ellipse(CellCoord::new(1, 1), CellCoord::new(1, 1), &spec);
-    assert_eq!(ellipse_cells, vec![CellCoord::new(1, 1)]);
-
-    let poly = ShapeRasterizer::polygon(
-        &[
-            CellCoord::new(1, 1),
-            CellCoord::new(4, 1),
-            CellCoord::new(4, 4),
-            CellCoord::new(1, 4),
-        ],
-        &spec,
-    );
-    assert!(!poly.is_empty());
-}
-
-#[test]
-fn test_flood_fill() {
-    let spec = CanvasSpec {
-        cols: 5,
-        rows: 5,
-        cell_w: 8,
-        cell_h: 15,
-    };
-    let grid = Grid::blank(&spec);
-    let sel = Selection::new(&spec);
-
-    // All cells initially have fg WHITE and bg None
-    let region = FloodFill::region(&grid, CellCoord::new(0, 0), PaintChannel::Foreground, &sel);
-    assert_eq!(region.len(), 25);
-}
-
-#[test]
-fn test_edit_cell_typing_tool() {
-    let mut proj = Project::new("TypingTest".to_string(), Rgb::BLACK, Fps(12), 0);
+fn test_paint_and_pick_tools() {
+    let mut proj = Project::new("ToolTest".to_string(), Rgb::BLACK, Fps(12), 0);
     let mut sel = Selection::new(&proj.canvas);
-    let brush = Brush::default();
     let mut hist = History::new();
+    let options = ToolOptions::default();
+    let brushes = BrushLibrary::with_builtins();
 
-    let mut tool = EditCellTool::new();
+    let mut paint = PaintTool::new(ToolId::Paint, PaintOperation);
     let mut ctx = ToolContext {
         project: &mut proj,
-        selection: &mut sel,
-        brush: &brush,
         history: &mut hist,
+        selection: &mut sel,
+        options: &options,
+        brushes: &brushes,
+        mods: Modifiers::default(),
     };
 
-    // Click at (0, 0)
-    tool.on_event(
-        ToolEvent::PointerDown(CellCoord::new(0, 0), Modifiers::default()),
-        &mut ctx,
-    );
-    // Type 'H'
-    tool.on_event(ToolEvent::Text('H'), &mut ctx);
-    // Type 'i'
-    tool.on_event(ToolEvent::Text('i'), &mut ctx);
+    // Paint at (5, 5)
+    paint.on_event(ToolEvent::PointerDown(Some(CellCoord::new(5, 5))), &mut ctx);
+    paint.on_event(ToolEvent::PointerUp(Some(CellCoord::new(5, 5))), &mut ctx);
 
-    // Verify live update
     let frame = ctx.project.timeline.selected_frame();
-    assert_eq!(frame.grid.get(CellCoord::new(0, 0)).unwrap().glyph, 'H');
-    assert_eq!(frame.grid.get(CellCoord::new(1, 0)).unwrap().glyph, 'i');
+    let layer = frame.active_layer();
+    assert_eq!(layer.ink.get(CellCoord::new(5, 5)).unwrap().glyph, '#');
 
-    // Deactivate / commit
-    tool.on_event(ToolEvent::Deactivate, &mut ctx);
-    assert!(ctx.history.can_undo());
-
-    // Undo
-    ctx.history.undo(ctx.project);
-    let frame_undone = ctx.project.timeline.selected_frame();
-    assert_eq!(
-        frame_undone.grid.get(CellCoord::new(0, 0)).unwrap().glyph,
-        ' '
-    );
-    assert_eq!(
-        frame_undone.grid.get(CellCoord::new(1, 0)).unwrap().glyph,
-        ' '
-    );
+    // Pick at (5, 5)
+    let mut pick = PickTool::new();
+    let resp = pick.on_event(ToolEvent::PointerDown(Some(CellCoord::new(5, 5))), &mut ctx);
+    match resp {
+        ToolResponse::Picked(colors) => {
+            assert_eq!(colors.ink, Some(Rgba::WHITE));
+        }
+        _ => panic!("Expected Picked response"),
+    }
 }

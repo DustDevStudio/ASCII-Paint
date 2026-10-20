@@ -125,7 +125,6 @@ impl Selection {
         for word in self.bits.iter_mut() {
             *word = u64::MAX;
         }
-        // Mask out excess bits in the last word
         let remainder = total % 64;
         if remainder != 0 {
             if let Some(last) = self.bits.last_mut() {
@@ -138,6 +137,95 @@ impl Selection {
 
     pub fn clear(&mut self) {
         self.clear_internal();
+        self.touch();
+    }
+
+    pub fn invert(&mut self) {
+        if self.is_empty() {
+            return;
+        }
+        let total = self.cols as usize * self.rows as usize;
+        let mut new_count = 0;
+        for (i, word) in self.bits.iter_mut().enumerate() {
+            *word = !*word;
+            let bits_in_word = if (i + 1) * 64 <= total {
+                64
+            } else {
+                total % 64
+            };
+            if bits_in_word < 64 {
+                *word &= (1u64 << bits_in_word) - 1;
+            }
+            new_count += word.count_ones() as usize;
+        }
+        self.count = new_count;
+        self.touch();
+    }
+
+    pub fn translate(&mut self, offset: (i32, i32)) -> bool {
+        if self.is_empty() || (offset.0 == 0 && offset.1 == 0) {
+            return true;
+        }
+        let bounds = match self.bounds() {
+            Some(b) => b,
+            None => return true,
+        };
+
+        let min_c = bounds.min.col as i32 + offset.0;
+        let max_c = bounds.max.col as i32 + offset.0;
+        let min_r = bounds.min.row as i32 + offset.1;
+        let max_r = bounds.max.row as i32 + offset.1;
+
+        if min_c < 0 || max_c >= self.cols as i32 || min_r < 0 || max_r >= self.rows as i32 {
+            return false;
+        }
+
+        let mut new_sel = Selection::new(&CanvasSpec {
+            cols: self.cols,
+            rows: self.rows,
+            cell_w: 1,
+            cell_h: 1,
+        });
+
+        for r in 0..self.rows {
+            for c in 0..self.cols {
+                let coord = CellCoord::new(c, r);
+                if self.contains(coord) {
+                    let new_c = (c as i32 + offset.0) as u16;
+                    let new_r = (r as i32 + offset.1) as u16;
+                    new_sel.set_bit(CellCoord::new(new_c, new_r), true);
+                }
+            }
+        }
+
+        self.bits = new_sel.bits;
+        self.count = new_sel.count;
+        self.touch();
+        true
+    }
+
+    pub fn restore(&mut self, other: &Selection) {
+        self.cols = other.cols;
+        self.rows = other.rows;
+        self.bits = other.bits.clone();
+        self.count = other.count;
+        self.touch();
+    }
+
+    pub fn resize(&mut self, spec: &CanvasSpec) {
+        let mut new_sel = Selection::new(spec);
+        for r in 0..self.rows.min(spec.rows) {
+            for c in 0..self.cols.min(spec.cols) {
+                let coord = CellCoord::new(c, r);
+                if self.contains(coord) {
+                    new_sel.set_bit(coord, true);
+                }
+            }
+        }
+        self.cols = spec.cols;
+        self.rows = spec.rows;
+        self.bits = new_sel.bits;
+        self.count = new_sel.count;
         self.touch();
     }
 
@@ -177,19 +265,15 @@ impl Selection {
             for c in 0..self.cols {
                 let coord = CellCoord::new(c, r);
                 if self.contains(coord) {
-                    // Top edge
                     if r == 0 || !self.contains(CellCoord::new(c, r - 1)) {
                         edges.push(EdgeSegment::new((c, r), (c + 1, r)));
                     }
-                    // Bottom edge
                     if r + 1 == self.rows || !self.contains(CellCoord::new(c, r + 1)) {
                         edges.push(EdgeSegment::new((c, r + 1), (c + 1, r + 1)));
                     }
-                    // Left edge
                     if c == 0 || !self.contains(CellCoord::new(c - 1, r)) {
                         edges.push(EdgeSegment::new((c, r), (c, r + 1)));
                     }
-                    // Right edge
                     if c + 1 == self.cols || !self.contains(CellCoord::new(c + 1, r)) {
                         edges.push(EdgeSegment::new((c + 1, r), (c + 1, r + 1)));
                     }
